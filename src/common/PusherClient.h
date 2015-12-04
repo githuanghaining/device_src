@@ -8,15 +8,14 @@ extern "C"{
 #endif
 
 /*
-修正了日志汇报里的一个错误
-支持了后台消息推送
+在对外的接口函数前 增加了Core_前缀
 
 Todo:
 检查汇报的日志时间计算错误问题
 播放端弹出慢时 编码方式会出问题
 确认linux下时间精度问题：usleep nanosleep setitimer select
 */
-#define VERSON                                  84
+#define VERSON                                  24
 
 //StatusBuffer[CLIENT_STATUS_BUFFER_LENGTH]; //0字节代表nat类型 1字节代表当前工作状态 2字节代表是否需要心跳返回 3字节代表是否需要编码 4字节代表启动模式 0是待命 1是udp广播 2是rtmp广播 3是录像 4是录像广播
 //当前状态
@@ -68,50 +67,55 @@ typedef enum {
 	AAC_TYPE_SAMPLE = 129
 } FrameSampleTypeEm;
 
-//对外发送消息的回调函数：
-//当该服务接收到调度服务器的开始推送命令时 会发出消息通知外壳调用PushData函数塞数据 json格式：{"Name":"StartPushData"}
-//当需要停止塞数据时 json格式：{"Name":"StopPushData"}
-//当该服务接收到时 对方发送的媒体数据时，会发出消息通知外壳调用PopData函数收数据 json格式：{"Name":"StartPopData"}
-//当需要需要停止收数据时 json格式：{"Name":"StopPopData"}
+/*
+对外发送消息的回调函数(json格式)：
+当新绑定了摄像头时            {"Name":"NewBoundCamera"}
+当解绑了摄像头时              {"Name":"UnBoundCamera"}
+当新被授权了摄像头时          {"Name":"NewAuthCamera"}
+当被取消授权了摄像头时        {"Name":"CancelAuthCamera"}
+当接受并建立了连接时          {"Name":"ConnectionAcceptted"}
+当连接断开时                  {"Name":"ConnectionClosed"}
+收到音视频数据时              {"Name":"StartPopData"}
+当设备登录成功或者配置变换时   {"Name":"PopConfig","Message":"HexConfigString(256字节 512字符)"}
+当设备收到在线消息时          {"Name":"PopMessage","Message":"HexMessageString(变长)","SrcID":"发送方ID"}
+当设备收到离线消息时          {"Name":"PopOffLineMessage","Message":"HexMessageString(变长)","SrcID":"发送方ID"}
+*/
 typedef int (*MessageCallBack)(void *apData, const char *aMessage);
 
-//开始云服务 接收调度命令         ini格式的配置串       开始采集并压缩音视频数据的回调函数
-void            StartCloudService(const char* aConfigString, void *apData, MessageCallBack apMessageCallBack);
+//开始云服务 接收调度命令                      ini格式的配置串      回调参数    开始采集并压缩音视频数据的回调函数
+unsigned int    Core_StartCloudService(const char* aConfigString, void *apData, MessageCallBack apMessageCallBack);
+//返回值 0:成功 1:失败
 
 //停止云服务
-void            StopCloudService();
+void            Core_StopCloudService();
 
-//获取以JSON格式给出的各种状态信息 返回的字符串由外面负责释放
-char*           GetStatus(); 
+//获取各种状态信息 
+char*           Core_GetStatus();
+//返回值 以JSON格式给出的字符串 由外面负责释放
 
-//推送消息             摄像头ID 往手机推送时为0       二进制消息缓冲区       缓冲区长度 最大256
-int             PushMessage(unsigned int aID, const char *aMessage, unsigned int aMessageLen);
+//往该服务塞入音视频采样数据    数据层索引 当前固定为0           音视频采样缓冲区          音视频采样缓冲区长度       32位时间戳单位毫秒  采样类型h264 NALU_TYPE 或者 音频类型
+unsigned int    Core_PushData(unsigned int aDataLevelPos, const char *aDataBuffer, unsigned int aBufferLength, unsigned int aTimestamp, unsigned char apFrameSampleType);
+//返回值 0:成功 1:失败
 
-//往该服务塞入音视频采样数据  数据层索引 当前固定为0    音视频采样缓冲区          音视频采样缓冲区长度    32位时间戳单位毫秒  采样类型h264 NALU_TYPE 或者 音频类型
-int             PushData(unsigned int aDataLevelPos, const char *aDataBuffer, unsigned int aBufferLength, unsigned int aTimestamp, unsigned char apFrameSampleType);
-
-//弹出一个音视频采样缓冲区 数据层索引 当前固定为0           采样数据长度              32位时间戳  采 样类型h264 NALU_TYPE 或者 音频类型
-char*           PopData(unsigned int aDataLevelPos, unsigned int *apFrameSampleLength, unsigned int *apTimestamp, unsigned char *apFrameSampleType);
+//弹出一个音视频采样           数据层索引 当前固定为0                        采样数据长度                 32位时间戳  采样类型h264 NALU_TYPE 或者 音频类型
+char*           Core_PopData(unsigned int aDataLevelPos, unsigned int *apFrameSampleLength, unsigned int *apTimestamp, unsigned char *apFrameSampleType);
+//返回值 音视频采样缓冲区
 
 //断开连接
-int             Disconnect();
+unsigned char   Core_Disconnect();
+//返回值 最后的状态代码 (ClientStatusEm)
 
-//以下是手机专用
-//摄像机绑定     摄像机序列号20字节             摄像头ID
-unsigned char   CameraBound(const char *aSN, unsigned int *apID);
+//连接设备                                 设备ID  连接字符串，在目标设备上通过GetConnecttionString获取
+unsigned char   Core_ConnectToClient(unsigned int aID, const char *aConnectString, const unsigned char *aParameterBuffer);
+//返回值 最后的状态代码 (ClientStatusEm)
 
-//摄像机解除绑定              摄像头ID
-unsigned char   CameraUnBound(unsigned int aID);
+//连接服务端  0是待命 1是udp广播 2是rtmp广播 3是录像 4是录像广播      6字节的转发Ip+Port
+unsigned char   Core_ConnectToServer(unsigned char aMode, unsigned char *aServerConnectInfo);
+//返回值 最后的状态代码 (ClientStatusEm)
 
-//连接摄像头                       摄像头ID
-void            ConnectMediaSource(unsigned int aID);
-
-//以下是摄像头专用
-//摄像机注册               摄像机序列号20字节        初始配置256字节                  摄像头ID
-unsigned char   CameraRegist(const char *aSN, const char* aConfig, unsigned int *apCameraID);
-
-                //0是待命 1是udp广播 2是rtmp广播 3是录像 4是录像广播
-int             StartConnectToServer(unsigned char aMode, unsigned char aAreaID);
+//获取连接串 60秒有效     
+char*           Core_GetConnecttionString();
+//返回值 连接字符串用于传递给需要连接本设备的另一方  缓冲区由外面负责释放
 
 //以下是存储解码专用 不应该公开给第三方
 void            InitEncoder8();

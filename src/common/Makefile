@@ -1,11 +1,12 @@
-CC=arm-arago-linux-gnueabi-gcc
-AR=arm-arago-linux-gnueabi-ar cr
-RANLIB=arm-arago-linux-gnueabi-ranlib
+CC=arm-hisiv100nptl-linux-gcc
+AR=arm-hisiv100nptl-linux-ar cr
+RANLIB=arm-hisiv100nptl-linux-ranlib
 
 INCLUDE =-I../include/
 INCLUDE +=-I../rtmp
 INCLUDE +=-I../third_lib/libopenssl/install/include/
 INCLUDE +=-I../third_lib/libcurl/install/include/
+INCLUDE +=-I../http-client
 
 #CFLAGS=-O0 -Wall -g -shared -fPIC
 CFLAGS=-O0 -Wall $(INCLUDE)

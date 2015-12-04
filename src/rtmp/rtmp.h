@@ -34,6 +34,7 @@
 #include <stddef.h>
 
 #include "amf.h"
+#include "rtmpcommon.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -286,6 +287,9 @@ extern "C"
     RTMP_LNK Link;
 	char server_ip[150];
 	char local_ip[50];
+	char device_type;
+	RTMPMetaData  metaData;
+	char accessToken[TOKEN_SIZE];
   } RTMP;
 
   int RTMP_ParseURL(const char *url, int *protocol, AVal *host,
@@ -317,6 +321,8 @@ extern "C"
 
   int RTMP_Connect(RTMP *r, RTMPPacket *cp);
   int RTMP_getDiskList(RTMP *r);
+  int RTMP_getServerIP(RTMP *r);
+
   struct sockaddr;
   int RTMP_Connect0(RTMP *r, struct sockaddr *svc);
   int RTMP_Connect1(RTMP *r, RTMPPacket *cp);

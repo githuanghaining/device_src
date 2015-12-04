@@ -72,3 +72,37 @@ void  GetDwordHash(unsigned long aSrc, char *apHashBuffer)
     apHashBuffer[6] = srcBuf1[3];
 }
 
+unsigned long long A_Convert(char * MediaSource)
+{
+	unsigned long long sum = 0;
+	unsigned long t = 0;
+	for(;*MediaSource;MediaSource++)
+	{
+		if (*MediaSource>='A' && *MediaSource <='F')
+		   t = *MediaSource-55;//a-f涔嬮棿鐨刟scii涓庡搴旀暟鍊肩浉宸�55濡�'A'涓�65,65-55鍗充负A
+		else
+		   t = *MediaSource-48;
+		sum<<=4;
+		sum|=t;
+	}
+	return sum;
+}
+
+unsigned long GetDwordID(char *apHashBuffer)
+{
+	unsigned long lcid = 0;
+	unsigned long long lhashID = 0;
+	char hashid[4],cHashID[8];
+	lhashID = A_Convert(apHashBuffer);
+	memcpy(cHashID,&lhashID,8);
+
+	hashid[0] = cHashID[6];
+	hashid[1] = cHashID[0];
+	hashid[2] = cHashID[2];
+	hashid[3] = cHashID[4];
+	memcpy(&lcid,hashid,4);
+
+	return lcid;
+}
+
+

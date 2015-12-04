@@ -40,10 +40,10 @@ extern unsigned int RTMP_C_FrameRate;
 //type 1 is audio data,type 2 is disk list
 typedef void (*audio_consume_pt)(int type,char* data,int len);
 
-void setCameraToken(DWORD cid, DWORD deadline_time, unsigned char* token);
-void setMobileToken(DWORD cid, DWORD user_id ,cid_list_t clt, DWORD deadline_time, unsigned char* token);
 void setDeviceType(unsigned char type);			//camera device type is 1,mobile device type is 2
-void setRecordFlag(unsigned char flag);			//0 is only live,1 is live&record
+void setMetaData(RTMPMetaData meta_data);
+void setToken(unsigned char* token);
+int getJPGServerIP(int fd);
 
 int ConnectToRtmpServer(const char* aUrl,audio_consume_pt fun,int recv_audio_flag);
 
@@ -57,19 +57,24 @@ void setLogDir(char* log_dir);
 //cmd: 0x0301 meminfo;  0x0302 time info   
 void Send_Log(const char *msg, int cmd);
 
-int SendAacInfo(const char *aAacInfoBuf, DWORD aAacInfoBufLen,DWORD time);
+//int SendAacInfo(const char *aAacInfoBuf, DWORD aAacInfoBufLen,DWORD time);
+int SendAacInfo(const char *aAacInfoBuf, DWORD aAacInfoBufLen,DWORD64 time);
 
-int SendNal(const char *aNalBuf, DWORD aNalBufLen,DWORD time);
+//int SendNal(const char *aNalBuf, DWORD aNalBufLen,DWORD time);
+int SendNal(const char *aNalBuf, DWORD aNalBufLen,DWORD64 time);
 
-int SendAAC(const char *aAacBuf, DWORD aAacBufLen,DWORD time);
+//int SendAAC(const char *aAacBuf, DWORD aAacBufLen,DWORD time);
+int SendAAC(const char *aAacBuf, DWORD aAacBufLen,DWORD64 time);
 
-int SendOpus(const char *aOpusBuf, DWORD aOpusBufLen,DWORD time);
+//int SendOpus(const char *aOpusBuf, DWORD aOpusBufLen,DWORD time);
+int SendOpus(const char *aOpusBuf, DWORD aOpusBufLen,DWORD64 time);
 
 void InitNet();
 
 #ifndef NETPUSH
 #ifndef WIN32
 DWORD Sys_GetTickCount(void);
+DWORD64 Sys_MicroSeconds(void);
 #endif
 #endif
 

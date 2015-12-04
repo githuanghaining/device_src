@@ -1,6 +1,6 @@
-CC=arm-arago-linux-gnueabi-gcc
-AR=arm-arago-linux-gnueabi-ar cr
-RANLIB=arm-arago-linux-gnueabi-ranlib
+CC=arm-hisiv100nptl-linux-gcc
+AR=arm-hisiv100nptl-linux-ar cr
+RANLIB=arm-hisiv100nptl-linux-ranlib
 #CFLAGS=-O0 -Wall -g -shared -fPIC
 CFLAGS=-O0 -Wall
 #LIBS=-lcrypto -lssl -lpthread -lrt

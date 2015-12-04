@@ -1,0 +1,2133 @@
+//#include "CameraAPI.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include "rtmpSender.h"
+#include <curl/curl.h>
+#include "PusherClient.h"
+#include "camera_log.h"
+#include "Hash_alg.h"
+#include "aes128.h"
+#include "platform_cfg.h"
+#include <openssl/aes.h>
+#include "cJSON.h"
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include "base64.h"
+
+#define DEVICE_TOKEN_SIZE 128
+
+#define LOG_MSG_SIZE		63
+#define LOG_TYPE_DEVICE		0x0301
+#define LOG_TYPE_SENDTIME	0x0302
+
+#define RTMP_TYPE_AUDIO_DATA	1
+#define RTMP_TYPE_DISK_INFO	2
+#define RTMP_TYPE_IMAGE_ADDR	3
+
+
+#define MAX_MESSAGE_SIZE 256
+#define MAX_MESSAGE_B64_BUFFER B64_ENCODE_SIZE(MAX_MESSAGE_SIZE)
+
+typedef enum {
+	UDP_P2P_CONNECTION_TYPE		= 0, //
+	RTMP_PUBLICLIVE_TYPE     	= 2,
+	RTMP_RECORDING_TYPE     	= 3,
+	RTMP_PUBLIC_RECORD_TYPE      	= 4
+}DevConnectionTypeEm;
+
+typedef struct rtmp_time
+{
+	unsigned long  Tstart;
+	unsigned long  Tbegain;
+	unsigned long  T1;
+	unsigned long  Tend;
+	unsigned long  Tn_T1;
+	unsigned long  Tstart_end;
+	unsigned long  Tend_start;
+}rtmp_time_t;
+
+rtmp_time_t rtmp_send_time;
+
+typedef int (*D_MessageCallBack)(void *apData, const char *aMessage);
+typedef void (*D_RtmpAudioCallBack)(void *apData,char* aData,int aDataLen);
+//typedef void (*D_RtmpAudioCallBack)(void *apData,char* aData,int aDataLen ,char aDataType);
+
+int  D_HttpPostRTMPURL(char aMode);
+int  D_HttpRemoveRTMPURL();
+int HttpPostRTMPURL(char aMode);
+int HttpRemoveRTMPURL();
+float D_GetPlatformVersion();
+
+static pthread_mutex_t s_mutex_token = PTHREAD_MUTEX_INITIALIZER;
+
+long LYRecording_Timestamp = 0;
+int rtmpopenflag = 0;
+int s_start_cloud_flag = 0;
+volatile int LY_PublicLiveFlag = 0;
+static int log_flag =0;
+static int retry_count =0;
+volatile unsigned long long LY_AlarmStartTime =0;
+unsigned char aacSeqHeader[2]={0};
+
+unsigned long C_StartTime = 0;
+unsigned int C_FrameRate;
+unsigned long C_BitRate;
+
+extern char RTMP_Enable_AES128;
+extern unsigned int RTMP_C_FrameRate;
+extern unsigned int RTMP_C_BitRate;
+
+const char *CenterWebServerAddr = "api.topvdn.com";
+const int CenterWebServerPort = 80;
+const char *PublicTransferServerAddr = "rtmp.public.topvdn.cn:1935/live/";
+
+platform_config_t platform_global_config;
+
+static void set_defalut_platform_config(const char *aServerAddr)
+{
+    if(aServerAddr)
+    	strcpy(platform_global_config.web_server_ip,aServerAddr);
+    else
+    {
+	struct hostent *host = NULL;
+	while(1)
+	{
+		printf("..... start get host name .....\n");	
+		host = gethostbyname(CenterWebServerAddr);
+      		if (host == NULL || host->h_addr == NULL)
+        	{
+			char msg[64]={0};
+          		sprintf(msg,"DNS failed addr:%s", CenterWebServerAddr);
+			Send_Log(msg,LOG_TYPE_DEVICE);
+    			strcpy(platform_global_config.web_server_ip,"api.topvdn.com");
+         		sleep(1);
+			continue; 	
+        	}
+		else
+			break;
+	}
+
+	strcpy(platform_global_config.web_server_ip,inet_ntoa(*(struct in_addr*)(host->h_addr_list[0])));
+	//inet_ntop(host->h_addrtype, host->h_addr_list[0], platform_global_config.web_server_ip, sizeof(platform_global_config.web_server_ip))
+    	//strcpy(platform_global_config.web_server_ip,"223.202.103.158");
+    	//printf("get dns ip:%s\n",platform_global_config.web_server_ip);
+    }
+
+    //strcpy(config->rtmp_url,"rtmp://120.24.88.82/live/999999");
+    strcpy(platform_global_config.rtmp_log_dir,"/media/mmcblk0p1/");
+    platform_global_config.rtmp_fun[0] = NULL;
+    platform_global_config.rtmp_fun[1] = NULL;
+
+    //strcpy(platform_global_config.rtmp_record_imgAddr,"api.topvdn.com:80");
+    platform_global_config.rtmp_record_imgAddr[0] = 0;
+    platform_global_config.web_server_port = 80;
+    //platform_global_config.web_server_timeout = 5;
+    platform_global_config.web_server_timeout = 10;
+    platform_global_config.cid = 0;
+    platform_global_config.hashid[0] = 0;
+    platform_global_config.rtmp_url[0] = 0;
+}
+
+static void set_defalut_globle_value()
+{
+	retry_count = 0;
+	C_StartTime = 0;
+	C_FrameRate = 0;
+	C_BitRate = 0;
+	RTMP_C_FrameRate = 0;
+	RTMP_C_BitRate = 0;
+	LY_AlarmStartTime = 0;	
+	
+	rtmp_send_time.Tbegain= 0;
+	rtmp_send_time.Tstart= 0;
+	rtmp_send_time.T1= 0;
+	rtmp_send_time.Tend = 0;
+	rtmp_send_time.Tn_T1 = 0;
+	rtmp_send_time.Tstart_end = 0;
+	rtmp_send_time.Tend_start = 0;
+}
+
+void D_Send_Log(const char *msg)
+{
+	Send_Log(msg,0x0301);
+}
+
+int Get_Device_Meminfo(char *msg)
+{
+//        char msg[40]={0};
+        char data[30]={0};
+        char key[10]={0};
+        char value[10]={0};
+
+        int i =4;
+        int ret = 0;
+        FILE *file;
+        file = fopen("/proc/meminfo","r");
+        if(file == NULL)
+	{
+                Send_Log("fopen meminfo failed!",0x0301);
+		return -1;
+	}
+
+        while(i--)
+        {
+                if(fgets(data,30,file) != NULL)
+                {
+                        ret = sscanf(data,"%s%s[^\n]",key,value);
+                        if(ret !=2){
+                                memset(data,0,sizeof(data));
+                                memset(key,0,sizeof(key));
+                                memset(value,0,sizeof(value));
+				Send_Log("fgets Mem return no data !",0x0301);
+                                continue;
+                        }
+#if 1
+                        if(strcmp(key,"MemTotal:") == 0){
+                                strcat(msg,"Mt:");
+                                strncat(msg,value,6);
+                        }else if(strcmp(key,"MemFree:") == 0){
+                                strcat(msg,",Mf:");
+                                strncat(msg,value,5);
+                        }else if(strcmp(key,"Buffers:") == 0){
+                                strcat(msg,",Bf:");
+                                strncat(msg,value,5);
+                        }else if(strcmp(key,"Cached:") == 0){
+                                strcat(msg,",Ch:");
+                                strncat(msg,value,5);
+                        }
+#endif
+                }
+                else
+                        Send_Log("fgets data==== null!",0x0301);
+        }
+
+	if(file)
+	{
+		fclose(file);
+		file = NULL;	
+	}
+
+	return 0;
+}
+
+int Get_Allfd(int pid)
+{
+	DIR * pdir;
+	struct dirent * pdirent;  
+//	struct stat f_ftime;   
+	int fcnt;/*文件数目统计*/
+	char path[25]={0};
+	sprintf(path,"/proc/%d/fd/",pid);  
+	pdir=opendir(path);  
+	if(pdir==NULL)  
+	{
+		strcat(path," failed!"); 
+		Send_Log(path,0x0301);
+		return 0; 
+	} 
+	fcnt=0; 
+	for(pdirent=readdir(pdir);pdirent!=NULL;pdirent=readdir(pdir))
+	{   
+		if(strcmp(pdirent->d_name,".")==0||strcmp(pdirent->d_name,"..")==0) 
+			continue; 
+		//if(stat(pdirent->d_name,&f_ftime)!=0) 
+		//	return 0;    
+		//if(S_ISDIR(f_ftime.st_mode)) 
+		//	continue; /*子目录跳过*/  
+		fcnt++;  
+		//printf("name:%s\n",pdirent->d_name); 
+	} 
+	//printf("all:%d\n",fcnt);
+	closedir(pdir);  
+	pdir = NULL;
+	pdirent = NULL;
+
+	return fcnt;
+}
+
+
+void *Msg_Handler(void *arg)
+{
+	//sleep(70);
+	char msg[64]={0};
+	float version = D_GetPlatformVersion();
+	sprintf(msg,"%s V:%.2f",(char *)arg,version);
+        Send_Log(msg,0x0301);
+	log_flag = 1;
+        Send_Log("start log msg_pthread success",0x0301);
+	char pid_fp[20];
+	int pid = getpid();
+	int fpcnt =0;
+	while(log_flag)
+	{
+		fpcnt = Get_Allfd(pid);
+		memset(msg,0,sizeof(msg));
+		if(Get_Device_Meminfo(msg) == 0)
+		{
+			sprintf(pid_fp,",pid:%d,fd:%d",pid,fpcnt);
+			strcat(msg,pid_fp);
+			Send_Log((const char *)msg,0x0301);
+		}
+		sleep(60);
+	}
+
+        Send_Log("log msg_pthread exit!",0x0301);
+	//pthread_exit(0);
+}
+
+pthread_t log_tid;
+void Create_log_pthread(const char *SN,const int aCid)
+{
+    	static char log[60]={0};
+    	sprintf(log,"sn:%s,cid:%d,StartCloudService",SN,aCid);
+    	//Send_Log(log,0x0301);
+	
+	if(log_flag == 0)
+	{
+		int err;
+        	//pthread_t tid;
+        	//pthread_attr_t attr_handle;
+		//pthread_attr_init(&attr_handle);
+        	//pthread_attr_setdetachstate(&attr_handle, PTHREAD_CREATE_DETACHED);
+        	//err = pthread_create(&tid,&attr_handle,Msg_Handler,NULL);
+        	err = pthread_create(&log_tid,NULL,Msg_Handler,(void *)log);
+        	if(err)
+        	{
+			memset(log,0,sizeof(log));
+			sprintf("sn:%s,cid:%d,create log pthread failed",SN,aCid);
+                	Send_Log(log,0x0301);
+                	return;
+        	}
+
+	}
+}
+
+
+int  D_StartCloudService(const char *app_id, const char* aSN, const char* aHashid, void *apData, D_MessageCallBack apMessageCallBack)
+{
+    if((NULL == app_id)||(NULL == aSN)||(NULL == aHashid))
+	return -1;
+
+    s_start_cloud_flag = 0;
+    unsigned long aCid = GetDwordID(aHashid);
+    if(aCid == 0)
+	return -1;
+
+    set_defalut_platform_config(NULL);
+    char SN[25]={0};
+    sprintf(SN,"%s%s",app_id,aSN);  
+    char strconfig[500];
+    memset(strconfig, 0, 500);
+    sprintf(strconfig,"[Config]\r\nCID=%lu\r\nSN=%s%s\r\nIsCaptureDev=1\r\nIsPlayDev=1\r\nIsSendBroadcast=0\r\nUdpSendInterval=2\r\n[Tracker]\r\nCount=3\r\nIP1=121.42.156.148\r\nPort1=80\r\nIP2=182.254.149.39\r\nPort2=80\r\nIP3=203.195.157.248\r\nPort3=80\r\n",aCid,app_id,aSN);
+
+    int nRet = StartCloudService(strconfig, apData, apMessageCallBack);
+    if(nRet == 0)
+    {
+	s_start_cloud_flag = 1;
+	Create_log_pthread((const char *)SN,aCid);
+        platform_global_config.cid = aCid;
+        strcpy(platform_global_config.hashid, aHashid);
+	printf("device hashid :%s len:%d\n",platform_global_config.hashid,strlen(platform_global_config.hashid));	
+    } 
+    else
+	return -1;
+
+    return nRet;
+}
+
+
+int  D_StartCloudService2(const char* aConfigString, void *apData, D_MessageCallBack apMessageCallBack)
+{
+    if(NULL == aConfigString)
+	return -1;
+
+    int nRet = 0;
+    char hashid[50]={0};
+    char devSN[20]={0};
+    char ServerAddr[32]={0};
+
+    //ret = sscanf(aString,"%*[^\n]\nCID=%16[^\r]%*[^\n]\nSN=%32[^\r]%*[^\n]\nLoginAddress=%30[^\r]\r\n%*s",cid,devsn,ServerAddr);
+    char *devCid_str = strstr(aConfigString,"\r\nCID=");
+    nRet = sscanf(devCid_str,"%*[^\n]\nCID=%30[^\r\n]",hashid);
+    char *devSN_str = strstr(aConfigString,"\r\nSN=");
+    nRet = sscanf(devSN_str,"%*[^\n]\nSN=%20[^\r\n]",devSN);
+    char *ServerAddr_str = strstr(aConfigString,"\r\nLoginAddress=");
+    nRet = sscanf(ServerAddr_str,"%*[^\n]\nLoginAddress=%32[^\r\n]",ServerAddr);
+
+    char *cid_start_offset = strstr(aConfigString,"CID=");
+    char *cid_end_offset = strstr(cid_start_offset,"\r\n");
+    printf("cid start:\n%s\n",cid_start_offset);
+    printf("cid end:\n%s\n",cid_end_offset);
+    printf("ret:%d hashid:%s, devsn:%s, ServerAddr:%s\n",nRet,hashid,devSN,ServerAddr);
+
+    unsigned long Cid = GetDwordID(hashid);
+    if(Cid == 0)
+	return -1;
+
+    char strconfig[500]={0};
+    char new_cid_str[50]={0};
+    sprintf(new_cid_str,"CID=%lu",Cid);
+    strncpy(strconfig,aConfigString,cid_start_offset-aConfigString);
+    strcat(strconfig,new_cid_str);
+    strcat(strconfig,cid_end_offset);
+
+    s_start_cloud_flag = 0;
+    set_defalut_platform_config(ServerAddr);
+
+    nRet = StartCloudService(strconfig, apData, apMessageCallBack);
+    if(nRet == 0)
+    {
+	s_start_cloud_flag = 1;
+	Create_log_pthread(devSN,Cid);
+        platform_global_config.cid = Cid;
+        strcpy(platform_global_config.hashid, hashid);
+	printf("device hashid :%s len:%d\n",platform_global_config.hashid,strlen(platform_global_config.hashid));	
+    } 
+    else
+	return -1;
+
+    return nRet;
+}
+    
+void  D_StopCloudService()
+{
+    if(s_start_cloud_flag)
+    {
+    	Send_Log("D_StopCloudService",0x0301);
+    	StopCloudService();
+	pthread_cancel(log_tid);
+	pthread_join(log_tid,0);
+    }
+
+    log_flag = 0;
+    s_start_cloud_flag = 0;
+}
+ 
+ 
+float D_GetPlatformVersion()
+{
+    float fversion = 0.0;
+    char *status = GetStatus();
+
+    if(status == NULL)
+    {
+	return -1;
+    }
+
+    cJSON *root = cJSON_Parse(status);
+    do {
+        if (root == NULL) {
+            break;
+        }
+        cJSON *version = cJSON_GetObjectItem(root, "ver");
+        if (version == NULL) {
+            break;
+        }
+	
+        fversion = atof(version->valuestring);
+
+    	//printf("======== ver_str:%s , fversion = %d\n",version->valuestring,fversion);
+
+    } while(0);
+
+
+    if (root) {
+        cJSON_Delete(root);
+    }
+    if(status != NULL)
+        free(status);
+
+    return fversion;
+}
+ 
+int D_GetDeviceToken(char *aToken, unsigned int sizeOfToken)
+{
+    size_t length = -1;
+//    pthread_mutex_lock(&s_mutex_token);
+
+    char *status = NULL;
+    status = GetStatus();
+    //printf("status:%s\n",status);
+    if (status == NULL) {
+//	pthread_mutex_unlock(&s_mutex_token);
+        return length;
+    }
+    cJSON *root = cJSON_Parse(status);
+    do {
+        if (root == NULL) {
+            break;
+        }
+        cJSON *token = cJSON_GetObjectItem(root, "ToKen");
+        if (token == NULL) {
+            break;
+        }
+        length = strlen(token->valuestring);
+        if (aToken && sizeOfToken > length) {
+            strcpy(aToken, token->valuestring);
+        }
+    } while(0);
+
+    if (root) {
+        cJSON_Delete(root);
+    }
+    //printf("======== token:%s , len = %d\n",aToken,TokenLength);
+    free(status);
+
+//    pthread_mutex_unlock(&s_mutex_token);
+    return length;
+}
+
+char* D_GetStatus()
+{
+#if 1
+    char *status = NULL;
+    status = GetStatus();
+    cJSON *root = cJSON_Parse(status);
+
+    cJSON *version = cJSON_GetObjectItem(root, "ver");
+    cJSON *loginsucc = cJSON_GetObjectItem(root, "LoginSucc");
+    cJSON *isOnLine = cJSON_GetObjectItem(root, "IsOnline");
+    cJSON *sendLostCount = cJSON_GetObjectItem(root, "SendLostCount");
+
+    float fversion = 0.0;
+    int login = 0;
+    int online = 0;
+    int sendLost = 0;
+
+    if (version != NULL) {
+        fversion = atof(version->valuestring);
+    }
+
+    if (loginsucc != NULL) {
+        login = loginsucc->valueint;
+    }
+
+    if (isOnLine != NULL) {
+        online = isOnLine->valueint;
+    }
+    if (sendLostCount != NULL) {
+        sendLost = sendLostCount->valueint;
+    }
+
+#if 1
+    static char status_json[300]={0};
+    if(version->valuestring == NULL || version == NULL)
+    	sprintf(status_json,"{\"VerSion\":%s,\"LoginSucc\":%d,\"IsOnline\":%d,\"SendLostCount\":%d}","0.0",login,online,sendLost);
+    else
+    	sprintf(status_json,"{\"VerSion\":%s,\"LoginSucc\":%d,\"IsOnline\":%d,\"SendLostCount\":%d}",version->valuestring,login,online,sendLost);
+    //sprintf(status_json,"{\"VerSion\":%.2f,\"LoginSucc\":%d,\"IsOnline\":%d,\"SendLostCount\":%d}",fversion,login,online,sendLost);
+#else
+    /*json root out */
+    cJSON * root_out = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root_out,"VerSion",fversion);
+    cJSON_AddNumberToObject(root_out,"LoginSucc",login);
+    cJSON_AddNumberToObject(root_out,"IsOnline",online);
+    cJSON_AddNumberToObject(root_out,"SendLostCount",sendLost);
+
+    //cJSON_AddStringToObject(root_out, "version", aData);
+    /*json output.*/
+    static char *status_json=cJSON_PrintUnformatted(root_out);
+    if (NULL == status_json) {
+        cJSON_Delete(root_out);
+    }
+
+    if (root_out) {
+        cJSON_Delete(root_out);
+    }
+#endif
+
+    if (root) {
+        cJSON_Delete(root);
+    }
+
+    if(status)
+        free(status);
+
+    return status_json;
+#else
+
+    return GetStatus();
+#endif
+}
+
+
+
+/* 
+char* D_GetStatus()
+{
+    return GetStatus();
+}
+*/
+
+static int frame_type(const char* p_data)
+{
+    char* pTmp = p_data;
+        if((*pTmp == 0)&&(*(pTmp+1)==0)&&(*(pTmp+2)==0)&&(*(pTmp+3)==1)){
+                char type = (*(pTmp+4)) & 0x1f;
+	
+                if(type == 7){
+                        return 7;
+                }else if(type == 8){
+                        return 8;
+                }
+                else if(type == 6){
+                        return 6;
+                }
+                else if(type == 5){
+                        return 5;
+                }
+                else if(type == 1){
+                        return 1;
+                }
+                else
+                        return -1;
+        }
+
+        return -1;
+}
+
+char* findSPSOffset(const char* p_data,int len)
+{
+    int i;
+    for(i=0;i<len;i++){
+            char* pTmp = p_data+i;
+            if(i+5 >=len)
+                return NULL;
+
+                        if(frame_type(pTmp) == 7){
+                                return pTmp;
+                                //return pTmp+4;
+                        }
+    }
+
+    return NULL;
+}
+
+char* findPPSOffset(const char* p_data,int len)
+{
+    int i;
+    for(i=0;i<len;i++){
+            char* pTmp = p_data+i;
+            if(i+5 >=len)
+                return NULL;
+
+                        if(frame_type(pTmp) == 8){
+                                return pTmp;
+                                //return pTmp+4;
+                        }
+    }
+
+    return NULL;
+}
+
+char* findSEIOffset(const char* p_data,int len)
+{
+    int i;
+    for(i=0;i<len;i++){
+            char* pTmp = p_data+i;
+            if(i+5 >=len)
+                return NULL;
+
+                        if(frame_type(pTmp) == 6){
+                                return pTmp;
+                                //return pTmp+4;
+                        }
+    }
+
+    return NULL;
+}
+
+char* findIFrameOffset(const char* p_data,int len)
+{
+    int i;
+    for(i=0;i<len;i++){
+            char* pTmp = p_data+i;
+            if(i+5 >=len)
+                return NULL;
+
+                        if(frame_type(pTmp) == 5){
+                                //return pTmp+4;
+                                return pTmp;
+                        }
+    }
+
+    return NULL;
+}
+
+char* findPFrameOffset(const char* p_data,int len)
+{
+    int i;
+    for(i=0;i<len;i++){
+            char* pTmp = p_data+i;
+            if(i+5 >=len)
+                return NULL;
+
+            if(frame_type(pTmp) == 1){
+                //return pTmp+4;
+                return pTmp;
+            }
+    }
+
+    return NULL;
+}
+
+char* findFrameOffset(const char* p_data,int len, unsigned char *aType)
+{
+    int i;
+    *aType = 0;
+    for(i=0;i<len;i++){
+            char* pTmp = p_data+i;
+            if(i+5 >=len)
+                return NULL;
+	
+	    int type = frame_type(pTmp);
+            if(type != -1){
+            	*aType = type;
+                //return pTmp+4;
+                return pTmp;
+            }
+    }
+
+    return NULL;
+}
+
+int   S_PushData(unsigned long aDataLevelPos, const char *aDataBuffer,  unsigned long  aBufferLength, unsigned long aTimestamp, unsigned char apFrameSampleType)
+{
+	int ret = 0;
+	char type = frame_type(aDataBuffer);
+	//printf(" type:%d, data src: %x,%x,%x,%x,%x,%x,%x,%x,%x,%x\n",type,*(aDataBuffer),*(aDataBuffer+1),*(aDataBuffer+2),*(aDataBuffer+3),*(aDataBuffer+4),*(aDataBuffer+5),*(aDataBuffer+6),*(aDataBuffer+7),*(aDataBuffer+8),*(aDataBuffer+9));
+        if(type==7){                    //first is sps
+                int spsLen;
+        	int ppsLen;
+        	int seiLen;
+        	int iframeLen;
+	
+        	char* pSPS = findSPSOffset(aDataBuffer,aBufferLength);
+        	char* pPPS = findPPSOffset(aDataBuffer,aBufferLength);
+        	char* pIFrame = findIFrameOffset(aDataBuffer,aBufferLength);
+        	int tmpLen = pIFrame-pPPS;
+        	char* pSEI = findSEIOffset(pPPS,tmpLen);
+
+        	if(pSEI){
+                	spsLen = pPPS - pSPS;
+                	ppsLen = pSEI - pPPS;
+                	seiLen = pIFrame - pSEI;
+                	iframeLen = aBufferLength - spsLen -ppsLen -seiLen;
+        	}
+        	else
+        	{	
+                        spsLen = pPPS - pSPS;
+                	ppsLen = pIFrame - pPPS;
+                	//ppsLen = pSEI - pPPS;
+                	iframeLen = aBufferLength - spsLen -ppsLen;
+        	}
+		
+#ifdef ENABLE_AES128
+		if(pIFrame)
+		{
+			unsigned char* encrypt_out;
+        		unsigned int encrypt_len;
+
+			//printf("iframe: %x %x %x %x %x %x %x\n",*pIFrame,*(pIFrame+1),*(pIFrame+2),*(pIFrame+3),*(pIFrame+4),*(pIFrame+5),*(pIFrame+6));
+        		int ret = D_aes_encrypt((unsigned char*)(pIFrame+1),(unsigned int)(iframeLen-1 - (iframeLen-1)%16),&encrypt_out,&encrypt_len);
+			if(ret != -1)
+			{
+        			memcpy(pIFrame+1,encrypt_out,encrypt_len);
+        			free(encrypt_out);
+			}
+		}
+#endif
+		//printf("D_aes_encrypt end .........sps:%d, pps:%d, iframe:%d\n",spsLen,ppsLen,iframeLen);
+		ret = PushData(aDataLevelPos,pSPS,spsLen,aTimestamp,NALU_TYPE_SPS);//7
+		ret = PushData(aDataLevelPos,pPPS,ppsLen,aTimestamp,NALU_TYPE_PPS);//8
+		ret = PushData(aDataLevelPos,pIFrame,iframeLen,aTimestamp,NALU_TYPE_IDR);//5
+        }
+	else if(type==1){                       //p frame
+                if(aBufferLength>4){
+                      ret = PushData(aDataLevelPos,aDataBuffer,aBufferLength,aTimestamp,NALU_TYPE_SLICE);//1
+                }
+        }
+	else 
+	{	//else if(apFrameSampleType == NALU_TYPE_AUD)
+		ret = PushData(aDataLevelPos,aDataBuffer,aBufferLength,aTimestamp,apFrameSampleType);
+		//printf("send aac  ===== length:%ld, time stamp: %ld , frame type: %x , type1 :%x\n",aBufferLength,aTimestamp,apFrameSampleType,type);
+	}
+	return ret;
+}
+
+
+char* D_PopData(unsigned long aDataLevelPos, unsigned long *apFrameSampleLength, unsigned long *apTimestamp, unsigned char *apFrameSampleType)
+{
+    return PopData(aDataLevelPos,apFrameSampleLength,apTimestamp,apFrameSampleType);
+}
+
+int D_GetAlarmPlayInfo(unsigned long long aAlarmTime)
+{
+        LY_AlarmStartTime = aAlarmTime;
+        return sendGetDiskListCommand();
+}
+
+int Send_Alarm_Msg(unsigned char *buffer, int disk_size)
+{
+        printf("=================start=================\n");
+        char msg[256];
+        //int disk_size = 0;
+        int ret =0;
+	//cid
+	msg[0] = platform_global_config.cid & 0xff;
+        msg[1] = (platform_global_config.cid>>8) & 0xff;
+        msg[2] = (platform_global_config.cid>>16) & 0xff;
+        msg[3] = (platform_global_config.cid>>24) & 0xff;
+	//alarm time
+        msg[4] = LY_AlarmStartTime & 0xff;
+        msg[5] = (LY_AlarmStartTime>>8) & 0xff;
+        msg[6] = (LY_AlarmStartTime>>16) & 0xff;
+        msg[7] = (LY_AlarmStartTime>>24) & 0xff;
+
+        memcpy(msg+8,buffer,disk_size);
+
+        printf("ret:%d time:%ld ,size:%d,msg0:%d\n",ret,LY_AlarmStartTime,disk_size,msg[0]);
+        ret = D_PushMessage(0, msg, disk_size+8);
+        printf("ret:%d \n",ret);
+        printf("=================end=================\n");
+
+        return ret;
+}
+
+unsigned char recvAudioSpecificConfig[2]={0};
+unsigned char aacFrame[2048]={0};
+
+static int getADTSHeader(char *packet, int packetLen)
+{
+	int profile = 2;  //AAC LC
+	int freqIdx = 3;  //11025:10 < 44.1KHz
+	int chanCfg = 1;  //mono
+	int frameLengthFlag = 0;
+	int dependsOnCoreCoder = 0;
+	int extensionFlag = 0;
+
+	//printf("getADTSHeader profile:%d, freqIdx:%d, chanCfg:%d\n",profile,freqIdx,chanCfg);
+#if 0
+	profile = (aacSeqHeader[0] & 0xf8)  >> 3 ;			//取前5bit
+	freqIdx = ((aacSeqHeader[0] & 0x07) << 1)|(aacSeqHeader[1] >> 7);//取后4bit
+	chanCfg = (aacSeqHeader[1] >> 3) & 0x0f;			//取后4bit
+	frameLengthFlag = (aacSeqHeader[1] >> 2) & 0x01;		//取后1bit
+	dependsOnCoreCoder = (aacSeqHeader[1] >> 1) & 0x01;		//取后1bit
+	extensionFlag = aacSeqHeader[1] & 0x01;				//最后1bit
+#else	
+	profile = (recvAudioSpecificConfig[0] & 0xf8)  >> 3 ;			//取前5bit
+	freqIdx = ((recvAudioSpecificConfig[0] & 0x07) << 1)|(recvAudioSpecificConfig[1] >> 7);//取后4bit
+	chanCfg = (recvAudioSpecificConfig[1] >> 3) & 0x0f;			//取后4bit
+	frameLengthFlag = (recvAudioSpecificConfig[1] >> 2) & 0x01;		//取后1bit
+	dependsOnCoreCoder = (recvAudioSpecificConfig[1] >> 1) & 0x01;		//取后1bit
+	extensionFlag = recvAudioSpecificConfig[1] & 0x01;				//最后1bit
+#endif
+	//printf("getADTSHeader profile:%d, freqIdx:%d, chanCfg:%d, frameLengthFlag:%d, depend:%d, extenflag:%d\n",profile,freqIdx,chanCfg,frameLengthFlag,dependsOnCoreCoder,extensionFlag);
+	
+	// fill in ADTS data
+	unsigned int num_data_block = packetLen/1024;
+	unsigned int frame_length = packetLen +7; 
+#if 1
+	//char aacheadtype[7] = {0xff,0xf1,0x68,0x80,0x16,0x62,0x64};
+	char aacheadtype[7] = {0xff,0xf1,0x68,0x40,0x16,0x00,0xfc};
+	memset(aacFrame,0,sizeof(aacFrame));
+        memcpy(aacFrame,aacheadtype,7);
+
+	/* frame size over last 2 bits */
+        aacFrame[3] |= (frame_length & 0x1800) >> 11;// the upper 2 bit
+        /* frame size continued over full byte */
+        aacFrame[4] = (frame_length & 0x1FF8) >> 3;// the middle 8 bit
+        /* frame size continued first 3 bits */
+	aacFrame[5] = 0x00;
+        aacFrame[5] |= (frame_length & 0x7) << 5;
+        aacFrame[5] |= 0x1F;
+#else
+	memset(aacFrame,0,sizeof(aacFrame));
+	aacFrame[0] = (unsigned char)0xFF;
+	aacFrame[1] = (unsigned char)0xF1;//0xF9
+	aacFrame[2] = (unsigned char)(((profile-1)<<6) + (freqIdx<<2) +(chanCfg>>2));
+    	aacFrame[3] = (unsigned char)(((chanCfg & 0x03)<<6) + (frame_length >> 11));
+    	aacFrame[4] = (unsigned char)((frame_length & 0x7FF) >> 3);
+    	aacFrame[5] = (unsigned char)(((frame_length & 0x07)<<5) + 0x1F);
+    	aacFrame[6] = (unsigned char)0xFC;
+
+    	//aacFrame[5] = (unsigned char)((frame_length << 5) & 0xE0);
+	//aacFrame[5] |= ((0x7FF >> 6) & 0x1F);  
+	//aacFrame[6] = (unsigned char)0xFC;
+    	//aacFrame[6] |= (num_data_block & 0x03);
+#endif
+	if(packetLen <= (sizeof(aacFrame)-7))
+		memcpy(aacFrame+7,packet,packetLen);
+	else
+		return 0;
+
+	return frame_length;
+} 
+
+static int getADTSHead(char *Adts_header, int packetLen)
+{
+	if(Adts_header == NULL)
+		return -1;
+
+	int profile = 2;  //AAC LC
+	int freqIdx = 3;  //11025:10 < 44.1KHz
+	int chanCfg = 1;  //mono
+	int frameLengthFlag = 0;
+	int dependsOnCoreCoder = 0;
+	int extensionFlag = 0;
+
+	//printf("getADTSHeader profile:%d, freqIdx:%d, chanCfg:%d\n",profile,freqIdx,chanCfg);
+#if 0
+	profile = (aacSeqHeader[0] & 0xf8)  >> 3 ;			//取前5bit
+	freqIdx = ((aacSeqHeader[0] & 0x07) << 1)|(aacSeqHeader[1] >> 7);//取后4bit
+	chanCfg = (aacSeqHeader[1] >> 3) & 0x0f;			//取后4bit
+	frameLengthFlag = (aacSeqHeader[1] >> 2) & 0x01;		//取后1bit
+	dependsOnCoreCoder = (aacSeqHeader[1] >> 1) & 0x01;		//取后1bit
+	extensionFlag = aacSeqHeader[1] & 0x01;				//最后1bit
+#else	
+	profile = (recvAudioSpecificConfig[0] & 0xf8)  >> 3 ;			//取前5bit
+	freqIdx = ((recvAudioSpecificConfig[0] & 0x07) << 1)|(recvAudioSpecificConfig[1] >> 7);//取后4bit
+	chanCfg = (recvAudioSpecificConfig[1] >> 3) & 0x0f;			//取后4bit
+	frameLengthFlag = (recvAudioSpecificConfig[1] >> 2) & 0x01;		//取后1bit
+	dependsOnCoreCoder = (recvAudioSpecificConfig[1] >> 1) & 0x01;		//取后1bit
+	extensionFlag = recvAudioSpecificConfig[1] & 0x01;				//最后1bit
+#endif
+	//printf("getADTSHeader profile:%d, freqIdx:%d, chanCfg:%d, frameLengthFlag:%d, depend:%d, extenflag:%d\n",profile,freqIdx,chanCfg,frameLengthFlag,dependsOnCoreCoder,extensionFlag);
+	
+	// fill in ADTS data
+	unsigned int num_data_block = (packetLen+7) / 1024;
+	unsigned int frame_length = packetLen + 7; 
+#if 1
+	//char aacheadtype[7] = {0xff,0xf1,0x68,0x80,0x16,0x62,0x64};
+	char aacheadtype[7] = {0xff,0xf1,0x68,0x40,0x16,0x00,0xfc};
+        memcpy(Adts_header, aacheadtype,7);
+
+	/* frame size over last 2 bits */
+        Adts_header[3] |= (frame_length & 0x1800) >> 11;// the upper 2 bit
+        /* frame size continued over full byte */
+        Adts_header[4] = (frame_length & 0x1FF8) >> 3;// the middle 8 bit
+        /* frame size continued first 3 bits */
+	Adts_header[5] = 0x00;
+        Adts_header[5] |= (frame_length & 0x7) << 5;
+        Adts_header[5] |= 0x1F;
+#else
+	Adts_header[0] = (unsigned char)0xFF;
+	Adts_header[1] = (unsigned char)0xF1;//0xF9
+	Adts_header[2] = (unsigned char)(((profile-1)<<6) + (freqIdx<<2) +(chanCfg>>2));
+    	Adts_header[3] = (unsigned char)(((chanCfg & 0x03)<<6) + (frame_length >> 11));
+    	Adts_header[4] = (unsigned char)((frame_length & 0x7FF) >> 3);
+    	Adts_header[5] = (unsigned char)(((frame_length & 0x07)<<5) + 0x1F);
+    	Adts_header[6] = (unsigned char)0xFC;
+
+    	//Adts_header[5] = (unsigned char)((frame_length << 5) & 0xE0);
+	//Adts_header[5] |= ((0x7FF >> 6) & 0x1F);  
+	//Adts_header[6] = (unsigned char)0xFC;
+    	//Adts_header[6] |= (num_data_block & 0x03);
+#endif
+
+	return 0;
+} 
+
+
+void D_SetRtmpAudioCallBack(void *apData, D_RtmpAudioCallBack aRtmpAudioCall)
+{
+        platform_global_config.rtmp_fun[0] = (char *)aRtmpAudioCall;
+        platform_global_config.rtmp_fun[1] = (char *)apData;
+}
+
+void RTMP_PopDataCall(int type,char* data,int len)
+{
+	if((data == NULL) || (len < 4))
+		return ;
+        int i,ret = -1;
+	switch(type)
+	{
+		case RTMP_TYPE_AUDIO_DATA:
+			if((data[0] == 0xaf) && (data[1] == 0x00) && (len == 4))
+			{	// 0xaf 0x00 aac info
+				//printf("....sdk-------recv rtmp aac info------\n");
+				recvAudioSpecificConfig[0] = data[2];
+				recvAudioSpecificConfig[1] = data[3];
+			}
+			else if((data[0] == 0xaf) && (data[1] == 0x01))
+			{	// x0af 0x01 aac data
+				if(platform_global_config.rtmp_fun[0] != NULL)
+				{
+					//printf("....sdk-------recv rtmp aac data ------\n");
+#if 0
+					int aac_length = getADTSHeader((char *)(data+2), len-2);
+                			((D_RtmpAudioCallBack)platform_global_config.rtmp_fun[0])((void *)platform_global_config.rtmp_fun[1],(const char *)aacFrame,aac_length);
+#else
+					int packetLen = len-2;
+					char *frameBuffer = (char *)malloc(packetLen+7);
+					if(frameBuffer == NULL)
+					{
+						printf("alloc aac buffer failed!\n");
+						return;
+					}
+					memset(frameBuffer,0,packetLen+7);
+					if(getADTSHead(frameBuffer, packetLen) == -1)
+						return;
+					memcpy(frameBuffer+7,data+2,packetLen);
+                			//((D_RtmpAudioCallBack)platform_global_config.rtmp_fun[0])((void *)platform_global_config.rtmp_fun[1],(const char *)frameBuffer,packetLen+7,RTMP_TYPE_AUDIO_DATA);
+                			((D_RtmpAudioCallBack)platform_global_config.rtmp_fun[0])((void *)platform_global_config.rtmp_fun[1],(const char *)frameBuffer,packetLen+7);
+					if(frameBuffer)
+						free(frameBuffer);
+#endif
+				}
+			}
+			break;
+
+		case RTMP_TYPE_DISK_INFO:
+                	//((D_RtmpAudioCallBack)platform_global_config.rtmp_fun[0])((void *)platform_global_config.rtmp_fun[1],(const char *)data,len,RTMP_TYPE_DISK_INFO);
+#if 0			
+                	for(i=0; i<3; i++)
+                	{
+                        	ret = Send_Alarm_Msg((unsigned char *)data, len);
+                        	if(ret == 1)
+                                	break;
+                        	else
+                                	usleep(300);
+                	}
+                	LY_AlarmStartTime = 0;
+#endif
+			break;
+
+		case RTMP_TYPE_IMAGE_ADDR:
+ 		        memset(platform_global_config.rtmp_record_imgAddr,0,sizeof(platform_global_config.rtmp_record_imgAddr));
+			memcpy(platform_global_config.rtmp_record_imgAddr, data, len);
+                	char msg[LOG_MSG_SIZE]={0};
+			sprintf(msg,"G_img srv ip:%s",platform_global_config.rtmp_record_imgAddr);
+                	Send_Log((const char *)msg,LOG_TYPE_DEVICE);
+	                //printf("get image server ip :%s\n",platform_global_config.rtmp_record_imgAddr);
+			break;
+
+		default:
+			break; 
+	}
+}
+
+int ConnectRTMP(RTMPMetaData aMetaData)
+{
+    int ret = -1;
+    if (rtmpopenflag == 0) {
+		//cmsprintf("SDK:connect to rtmp server\n");
+#if 1
+		setDeviceType(1);
+		char token[DEVICE_TOKEN_SIZE] = {0};
+                int token_len = D_GetDeviceToken(token, sizeof(token));
+                if (token_len == -1)
+                {
+                        return -1;
+                }
+		setToken(token);
+    		setMetaData(aMetaData);
+		//setLogDir(platform_global_config.rtmp_log_dir);
+		//platform_global_config.rtmp_fun[0] = (char *)aRtmpAudioCall;
+                ret = ConnectToRtmpServer((const char *)platform_global_config.rtmp_url,RTMP_PopDataCall,1);
+		//ret = ConnectToRtmpServer((const char *)platform_global_config.rtmp_url,RTMPPopDataCallBack,1);
+#else
+		//setLogDir("./");
+		setDeviceType(1);
+		char token[DEVICE_TOKEN_SIZE] = {0};
+                int token_len = D_GetDeviceToken(token, sizeof(token));
+                if (token_len == -1)
+                {
+                        return -1;
+                }
+		setToken(token);
+    		setMetaData(aMetaData);
+    		char url[50];
+    		memset(url,0,50);
+    		sprintf(url,"rtmp://183.57.151.177:1935/live/%d",platform_global_config.cid);
+		//platform_global_config.rtmp_fun[0] = (char *)aRtmpAudioCall;
+                ret = ConnectToRtmpServer(url,RTMP_PopDataCall,1);
+		//ret = ConnectToRtmpServer("rtmp://192.168.2.197:1936/demo/1001",RTMP_PopDataCall,1);
+#endif
+    }
+    return ret;
+}
+
+void DisConnectRTMP()
+{
+    if (rtmpopenflag == 1) {
+        rtmpopenflag = 0;
+        DisconnectRtmpServer();
+    }
+}
+
+int  D_StartRtmpServer(RTMPMetaData aMetaData)
+{
+    set_defalut_globle_value();
+    return ConnectRTMP(aMetaData);
+}
+    
+void  D_StopRtmpServer()
+{
+    DisConnectRTMP();
+}
+
+
+void Count_BitRate_FrameRate(unsigned long aBufferLength, unsigned char apFrameSampleType)
+{
+	if(apFrameSampleType == NALU_TYPE_AUD || apFrameSampleType == AAC_TYPE_INFO || apFrameSampleType == AAC_TYPE_SAMPLE)
+		;
+		//printf("audio frame\n");
+	else
+	{
+		C_FrameRate++;		
+	}
+
+	C_BitRate += aBufferLength;
+	
+	unsigned long  subTime = 0;
+        unsigned long  curTime = Sys_GetTickCount();
+        if(C_StartTime == 0 || C_StartTime > curTime)
+	{
+                C_StartTime = curTime;
+		return;
+	}
+
+        subTime = curTime - C_StartTime;
+        if(subTime >= 2000)
+        {
+                //printf("subTime:%ld ,vframe: %d,tatol bit:%ld,kb:%d \n",subTime,C_FrameRate/2,C_BitRate/2,C_BitRate/1024/2);
+                C_StartTime = curTime;
+		RTMP_C_FrameRate = C_FrameRate/2;
+		RTMP_C_BitRate = C_BitRate/1024/2;
+		C_FrameRate = 0;
+		C_BitRate = 0;
+        }
+}
+
+void GetOneFrame_Sending_StartTime()
+{
+        rtmp_send_time.Tstart = 0;
+        rtmp_send_time.Tstart = Sys_GetTickCount();
+        if(rtmp_send_time.T1 == 0 || rtmp_send_time.T1 > rtmp_send_time.Tstart)
+                rtmp_send_time.T1 = rtmp_send_time.Tstart;
+        else
+                rtmp_send_time.Tend_start += (rtmp_send_time.Tstart - rtmp_send_time.Tend);
+}
+
+void GetOneFrame_Sending_EndTime()
+{
+        rtmp_send_time.Tend = Sys_GetTickCount();
+        //printf("tend:%ld, t1:%ld\n",Tend,T1);
+        rtmp_send_time.Tn_T1 = rtmp_send_time.Tend - rtmp_send_time.T1;
+        rtmp_send_time.Tstart_end += (rtmp_send_time.Tend - rtmp_send_time.Tstart);
+
+        if(rtmp_send_time.Tbegain == 0)
+        {
+                rtmp_send_time.Tbegain = rtmp_send_time.Tstart;
+        }
+
+        if(rtmp_send_time.Tn_T1 >= 5000)
+        {
+                //printf(" === Tn_T1:%ld, Tsend:%ld, Tfree:%ld\n",rtmp_send_time.Tn_T1,rtmp_send_time.Tstart_end,rtmp_send_time.Tend_start);
+                //send_log();
+                char info[50]={0};
+		sprintf(info,"T5_T1:%ld, Tsend:%ld, Tfree:%ld",rtmp_send_time.Tn_T1,rtmp_send_time.Tstart_end,rtmp_send_time.Tend_start);
+                Send_Log((const char *)info,0x0302);
+#if 0
+                //if((rtmp_send_time.Tend-rtmp_send_time.Tbegain) >= )
+                if((double)rtmp_send_time.Tstart_end/(double)rtmp_send_time.Tend_start >= 0.5)                          
+                {
+                        printf("========== send msg to app ==========:%lf\n",(double)rtmp_send_time.Tstart_end/(double)rtmp_send_time.Tend_start);
+                        D_PushMessage(0, "12345", 5);
+                }                       
+#endif
+                rtmp_send_time.T1 = 0;
+                rtmp_send_time.Tend = 0;
+                rtmp_send_time.Tn_T1 = 0;
+                rtmp_send_time.Tstart_end = 0;
+                rtmp_send_time.Tend_start = 0;
+        }
+}
+
+//int SendRtmpPacket(char * aDataBuffer,unsigned long aBufferLength, unsigned long aTimestamp,unsigned char aFrameType)
+int SendRtmpPacket(char * aDataBuffer,unsigned long aBufferLength, unsigned long long aTimestamp,unsigned char aFrameType)
+{
+	int nRet = -1;
+        if(aFrameType == 7)
+	{       //first is sps
+		int spsLen;
+                int ppsLen;
+                int seiLen;
+                int iframeLen;
+
+                char* pSPS = findSPSOffset(aDataBuffer,aBufferLength);
+                char* pPPS = findPPSOffset(aDataBuffer,aBufferLength);
+                char* pIFrame = findIFrameOffset(aDataBuffer,aBufferLength);
+                int tmpLen = pIFrame-pPPS;
+                char* pSEI = findSEIOffset(pPPS,tmpLen);
+
+                if(pSEI){
+                        spsLen = pPPS - pSPS -4;
+                        ppsLen = pSEI - pPPS -4;
+                        seiLen = pIFrame - pSEI -4;
+                        iframeLen = aBufferLength - spsLen -ppsLen -seiLen -16;
+                }
+                else
+                {
+                        spsLen = pPPS - pSPS -4;
+                	ppsLen = pIFrame - pPPS -4;
+                        	//ppsLen = pSEI - pPPS -4;
+                        iframeLen = aBufferLength - spsLen -ppsLen -12;
+                }
+			
+#ifdef ENABLE_AES128
+		if(LY_PublicLiveFlag == 0)		//is not publicLive
+		{
+			RTMP_Enable_AES128 = 0x01;
+			if(pIFrame)
+        		{
+            			unsigned char* encrypt_out;
+            			unsigned int encrypt_len;
+
+        			int ret = D_aes_encrypt((unsigned char*)(pIFrame+4+1),(unsigned int)(iframeLen-1 - (iframeLen-1)%16),&encrypt_out,&encrypt_len);
+
+        			memcpy(pIFrame+4+1,encrypt_out,encrypt_len);
+            			free(encrypt_out);
+			}
+        	}
+#endif
+
+		//printf("D_aes_encrypt end .........sps:%d, pps:%d, iframe:%d\n",spsLen,ppsLen,iframeLen);
+		nRet = SendNal(pSPS+4,spsLen,aTimestamp);
+        	nRet = SendNal(pPPS+4,ppsLen,aTimestamp);
+		nRet = SendNal(pIFrame+4,iframeLen,aTimestamp);
+		//printf("D_aes_encrypt end iframe:%x %x %x %x %x %x %x %x %x %x\n",*(pIFrame+4),*(pIFrame+4+1),*(pIFrame+4+2),*(pIFrame+4+3),*(pIFrame+4+4),*(pIFrame+4+5),*(pIFrame+4+6),*(pIFrame+4+7),*(pIFrame+4+8),*(pIFrame+4+9));
+    	}
+        else if(aFrameType == 1)
+	{   
+		//p frame	
+		if(aBufferLength>4)
+		{
+                	nRet = SendNal(aDataBuffer+4,aBufferLength-4,aTimestamp);
+                }
+        }
+	else if(aFrameType == 6)
+	{
+		printf("frame type 6 , drop!\n");
+		//frame start type: 00 00 00 01 06
+		//if(aBufferLength>4)
+                //{
+	}
+	else
+	{        	
+		nRet = SendNal(aDataBuffer+4,aBufferLength-4,aTimestamp);
+	}
+	
+	return nRet;
+}
+
+
+//int S_SendRTMPData(char * aDataBuffer,unsigned long aBufferLength, unsigned long aTimestamp,unsigned char apFrameSampleType)
+int S_SendRTMPData(char * aDataBuffer,unsigned long aBufferLength, unsigned long long aTimestamp,unsigned char apFrameSampleType)
+{
+    int nRet = -1;
+    unsigned long  Tstart = 0;
+
+    if(aTimestamp == 0)
+	Send_Log("rtmp timeStamp is 00",0x0301);	
+	
+    GetOneFrame_Sending_StartTime();
+
+    RTMP_Enable_AES128 = 0x00;
+    Count_BitRate_FrameRate(aBufferLength,apFrameSampleType);
+
+    //aTimestamp = aTimestamp%0xFFFFFE;
+    if(apFrameSampleType == NALU_TYPE_AUD)
+    {
+        	nRet = SendOpus(aDataBuffer, aBufferLength,aTimestamp);
+    }
+    else if(apFrameSampleType == AAC_TYPE_INFO)
+    {
+		nRet = SendAacInfo(aDataBuffer, aBufferLength,aTimestamp);
+		//printf("send aac info ===== length:%ld, time stamp: %ld\n",aBufferLength,aTimestamp);
+    }
+    else if(apFrameSampleType == AAC_TYPE_SAMPLE)
+    {
+		nRet = SendAAC(aDataBuffer, aBufferLength,aTimestamp);
+		//printf("send aac sample ===== length:%ld, time stamp: %ld\n",aBufferLength,aTimestamp);
+    }
+    else
+    {
+	 	int ret = 0;
+        	char type = frame_type(aDataBuffer);
+		if(type == 6)
+		{
+			char* pFrame = findFrameOffset(aDataBuffer+4,aBufferLength-4,&type);
+			if(type > 0)
+			{
+                                if(pFrame){
+                                        int seiFrame_len = pFrame - aDataBuffer;
+                                        printf("s total:%d len:%d, data:%x %x %x %x %x \n",aBufferLength,seiFrame_len,*aDataBuffer,*(aDataBuffer+1),*(aDataBuffer+2),*(aDataBuffer+3),*(aDataBuffer+4));
+                                        //SendNal(aDataBuffer+4,seiFrame_len-4,aTimestamp);             //sei frame
+                                        //nRet = SendNal(pFrame+4,aBufferLength-seiFrame_len-4,aTimestamp);       //p frame
+					nRet = SendRtmpPacket(pFrame+4, aBufferLength-seiFrame_len-4, aTimestamp, type);	
+                                        printf("p len:%d, data:%x %x %x %x %x \n",aBufferLength-seiFrame_len,*pFrame,*(pFrame+1),*(pFrame+2),*(pFrame+3),*(pFrame+4));
+				}
+			}
+			else
+				printf("==== frame 6 %x, drop! ====\n",type);		
+		}
+		else
+			nRet = SendRtmpPacket(aDataBuffer, aBufferLength, aTimestamp, type);	
+
+	}
+	
+	GetOneFrame_Sending_EndTime();
+
+	return nRet;
+}
+
+static int GetAacHeadInfo(char *payload, long dataLen)
+{
+        int profile = ((payload[2]&0xc0)>>6)+1;
+        int sample_rate = (payload[2]&0x3c)>>2;
+        int channel = ((payload[2]&0x1)<<2)|((payload[3]&0xc0)>>6);
+        int config1 = (profile<<3)|((sample_rate&0xe)>>1);
+        int config2 = ((sample_rate&0x1)<<7)|(channel<<3);
+
+        aacSeqHeader[0] = config1&0xFF;
+        aacSeqHeader[1] = config2&0xFF;
+
+        //printf("...profile:%d, sample_rate:%d, channel:%d, config1:%d, config2:%d,aac header1:%x,aac header2:%x\n",profile,sample_rate,channel,config1,config2,aacSeqHeader[0],aacSeqHeader[1]);
+        return 0;
+}
+
+static void GetAudioSpecificConfig(char *AdtsHeader, long DataLength, char *pAudioSpecificConfig)
+{
+        int profile = ((AdtsHeader[2]&0xc0)>>6)+1;
+        int sample_rate = (AdtsHeader[2]&0x3c)>>2;
+        int channel = ((AdtsHeader[2]&0x1)<<2)|((AdtsHeader[3]&0xc0)>>6);
+        int config1 = (profile<<3)|((sample_rate&0xe)>>1);
+        int config2 = ((sample_rate&0x1)<<7)|(channel<<3);
+
+        pAudioSpecificConfig[0] = config1&0xFF;
+        pAudioSpecificConfig[1] = config2&0xFF;
+
+        //printf("...profile:%d, sample_rate:%d, channel:%d, config1:%d, config2:%d,aac header1:%x,aac header2:%x\n",profile,sample_rate,channel,config1,config2,pAudioSpecificConfig[0],pAudioSpecificConfig[1]);
+
+}
+
+int D_SendRTMPData(char * aDataBuffer,unsigned long aBufferLength, unsigned long long aTimestamp,unsigned char apFrameSampleType)
+{
+	int nRet = -1;
+	if(apFrameSampleType == AAC_TYPE_SAMPLE)        
+	{			
+		char AudioSpecificConfig[2]={0};	
+		GetAudioSpecificConfig((char *)aDataBuffer, aBufferLength, AudioSpecificConfig);	        
+		nRet = S_SendRTMPData((char *)AudioSpecificConfig, 2, aTimestamp, AAC_TYPE_INFO);        
+		nRet = S_SendRTMPData((char *)(aDataBuffer+7), aBufferLength-7, aTimestamp, AAC_TYPE_SAMPLE);
+	}
+         else
+         	nRet = S_SendRTMPData((char *)aDataBuffer, aBufferLength, aTimestamp, apFrameSampleType);
+	
+	return nRet;
+}
+
+int   D_PushData(unsigned long aDataLevelPos, const char *aDataBuffer, unsigned long aBufferLength, unsigned long aTimestamp, unsigned char apFrameSampleType)
+{
+	int nRet = 0;
+        if(rtmpopenflag == 0) //p2p
+                nRet =  S_PushData(aDataLevelPos, aDataBuffer, aBufferLength, aTimestamp, apFrameSampleType);
+        else            //rtmp
+        {
+                if(apFrameSampleType == AAC_TYPE_SAMPLE)
+                {
+#if 0
+                        GetAacHeadInfo((char *)(aDataBuffer), aBufferLength);
+                        nRet = S_SendRTMPData((char *)aacSeqHeader, 2, aTimestamp, AAC_TYPE_INFO);
+#else
+			char AudioSpecificConfig[2]={0};
+			GetAudioSpecificConfig((char *)aDataBuffer, aBufferLength, AudioSpecificConfig);
+                        nRet = S_SendRTMPData((char *)AudioSpecificConfig, 2, aTimestamp, AAC_TYPE_INFO);
+#endif
+                        nRet = S_SendRTMPData((char *)(aDataBuffer+7), aBufferLength-7, aTimestamp, AAC_TYPE_SAMPLE);
+                }
+                else
+                        nRet = S_SendRTMPData((char *)aDataBuffer, aBufferLength, aTimestamp, apFrameSampleType);
+        }
+
+        return nRet;
+}
+
+//int SetRtmpConnectMessage(char *rtmpMessgae)
+int SetRtmpConnectMessage(unsigned char *data)
+{
+    //unsigned char *data = rtmpMessgae;
+    //printf("get rtmp ip: %d %d %d %d %d %d \n",data[0],data[1],data[2],data[3],data[4],data[5]);
+    if((data[0]==0x00) && (data[1]==0x00) && (data[2]==0x00) && (data[3]==0x00))
+    {
+        Send_Log("get rtmp server ip is 0.0.0.0",0x0301);
+	printf("get rtmp ip is 000000 \n");
+        return -1;
+    }
+
+    unsigned short port = *(unsigned short *)(data+4);
+    char url[60];
+    memset(url,0,60);
+    sprintf(url,"rtmp://%d.%d.%d.%d:%d/live/%d",data[3],data[2],data[1],data[0],port,platform_global_config.cid);
+    strcpy(platform_global_config.rtmp_url,url);
+    //printf("rtmp url port:%d :%s\n",port,platform_global_config.rtmp_url);
+	
+    return 0;
+}
+
+int D_StartConnectToServer(char aMode,RTMPMetaData aMetadata)
+{
+	if(s_start_cloud_flag == 0)
+		return -1;
+	int i=0;
+	LYRecording_Timestamp = 0;
+	if((aMode == 0x02) || (aMode == 0x04))
+		LY_PublicLiveFlag = 1;
+
+	unsigned char ServerConnectInfo[10]={0};
+	//printf("===== amode ==== %d\n",aMode);
+	unsigned char ret = ConnectToServer(aMode, ServerConnectInfo);
+	//printf("ConnectToServer ret === %x , info: %d %d %d %d %d %d\n",ret,ServerConnectInfo[0],ServerConnectInfo[1],ServerConnectInfo[2],ServerConnectInfo[3],ServerConnectInfo[4],ServerConnectInfo[5]);
+    	if(ret != 4)
+        	return -1;
+
+	int nRet =  SetRtmpConnectMessage(ServerConnectInfo);
+	if(nRet == -1)
+		goto failed;
+
+	if(LY_PublicLiveFlag)
+    	{
+        	for(i=0;i<10;i++)
+       		{
+                	//nRet = D_HttpPostRTMPURL(aMode);
+                	nRet =  HttpPostRTMPURL(aMode);
+                	if(nRet == 0)
+                        	break;
+                	else
+                        	usleep(500);
+        	}
+
+		if(nRet != 0)
+        		goto failed;
+    	}
+
+	nRet = D_StartRtmpServer(aMetadata);
+	if(nRet == 0)
+	{
+        	rtmpopenflag = 1;
+		if((aMode == 0x03) || (aMode == 0x04))
+		{
+			//printf("========== send get image server addr ==========\n");
+			getJPGServerIP(0);
+		}
+		return 0;
+	}
+
+failed:
+	D_Disconnect();
+	return -1;
+}
+
+int  D_Disconnect()
+{
+	if(LY_PublicLiveFlag)
+		//D_HttpRemoveRTMPURL();
+		HttpRemoveRTMPURL();	
+
+	LY_PublicLiveFlag = 0;
+	LYRecording_Timestamp = 0;
+	D_StopRtmpServer();
+	return Disconnect();
+}
+
+
+//int http_post_file(char *token,char* ip,int port,int cid, int timestamp,int image_type,char* image_buffer, long image_size)
+int http_post_file(char *token,char* post_url, int timestamp,int image_type,char* image_buffer, long image_size)
+{
+    CURL *curl = NULL;
+    CURLcode res;
+    
+    struct curl_httppost *post=NULL;
+    struct curl_httppost *last=NULL;
+    
+    //if(image_buffer == NULL || ip == NULL)
+    if(image_buffer == NULL || post_url == NULL)
+    {
+        //http_msg("image_buffer == NULL || ip == NULL");
+        Send_Log("image_buffer == NULL || ip == NULL",0x0301);
+	return -1;
+    }
+   
+#if 0
+    char hashID[50];
+    memset(hashID,0,50);
+    GetDwordHash(cid,hashID);
+    char hash[50];
+    memset(hash,0,50);
+    int i;
+    for(i=0;i<8;i++)
+    {
+        sprintf(hash+i*2,"%02X",(unsigned char )hashID[i]);
+    }
+//    printf("hashid :%s\n",hash);
+  
+    char post_url[500];
+    memset(post_url,0,sizeof(post_url));
+    //sprintf(post_url,"http://%s:%d/API/cameras/%s/images/upload",ip,port,platform_global_config.hashid);
+    sprintf(post_url,"http://%s/API/cameras/%s/images/upload",platform_global_config.rtmp_record_imgAddr,platform_global_config.hashid);
+   
+    printf("post pic:%s\n",post_url);
+#endif
+ 
+    char timestamp_str[30];
+    memset(timestamp_str,0,sizeof(timestamp_str));
+    sprintf(timestamp_str,"%d",timestamp);
+    
+    char image_type_str[10];
+    memset(image_type_str,0,sizeof(image_type_str));
+    sprintf(image_type_str,"%d",image_type);
+    //cmsprintf("post image type: %d , str:%s\n",image_type,image_type_str); 
+
+    char filename[200];
+    memset(filename,0,sizeof(filename));
+    sprintf(filename,"%d_%d.jpg",platform_global_config.cid,timestamp);
+    
+    /* Add simple file section */
+    
+    if(curl_formadd(&post, &last, CURLFORM_COPYNAME, "type",CURLFORM_PTRCONTENTS,image_type_str,CURLFORM_CONTENTSLENGTH,strlen(image_type_str), CURLFORM_END) != 0)
+    //if(curl_formadd(&post, &last, CURLFORM_COPYNAME, "is_recording",CURLFORM_PTRCONTENTS,is_recording_str,CURLFORM_CONTENTSLENGTH,strlen(is_recording_str), CURLFORM_END) != 0)
+    {
+        //http_msg("curl_formadd is_recording error");
+	Send_Log("curl_formadd is_recording error",0x0301);
+        curl_formfree(post);
+        return -1;
+    }
+    
+    if(curl_formadd(&post, &last, CURLFORM_COPYNAME, "timestamp",CURLFORM_PTRCONTENTS,timestamp_str,CURLFORM_CONTENTSLENGTH,strlen(timestamp_str), CURLFORM_END) != 0)
+    {
+        //http_msg("curl_formadd timestamp error");
+	Send_Log("curl_formadd timestamp error",0x0301);
+        curl_formfree(post);
+        return -1;
+    }
+    
+    if( curl_formadd(&post, &last, CURLFORM_COPYNAME, "pic",CURLFORM_BUFFER, filename,CURLFORM_BUFFERPTR,image_buffer,CURLFORM_BUFFERLENGTH,image_size, CURLFORM_END) != 0)
+    {
+        //http_msg("curl_formadd pic error");
+	Send_Log("curl_formadd pic error",0x0301);
+        curl_formfree(post);
+        return -1;
+    }
+    
+    curl = curl_easy_init();
+    if(curl == NULL)
+    {
+        //http_msg("curl_easy_init() error");
+	Send_Log("curl_easy_init() error",0x0301);
+        curl_formfree(post);
+        return -1;
+    }
+#if 1
+    /* set http header */
+    struct  curl_slist*   chunk = NULL;//init to NULL
+    char x_camera_token[DEVICE_TOKEN_SIZE]={0};
+    sprintf(x_camera_token,"X-Camera-Token: %s",token);
+
+    /* Add header X-Camera-Token */
+    chunk = curl_slist_append(chunk, x_camera_token);
+
+    /* Modify header Content-Type */ 
+    chunk = curl_slist_append(chunk, "Content-Type: multipart/form-data; charset=utf-8");
+
+    /* Remove header Expect */
+    chunk = curl_slist_append(chunk, "Expect:");
+ 
+    curl_easy_setopt(curl,CURLOPT_HTTPHEADER, chunk);
+#endif    
+    curl_easy_setopt(curl, CURLOPT_HEADER, 0);
+    curl_easy_setopt(curl, CURLOPT_URL, post_url); /*Set URL*/
+    curl_easy_setopt(curl, CURLOPT_HTTPPOST, post);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, platform_global_config.web_server_timeout);
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 0);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1); //忽略域名解析失败时发出的signal信息
+    /*curl_easy_setopt(curl, CURLOPT_POST, 1);	//CURLOPT_POST: 设置为非0表示本次操作为POST*/
+    /*curl_easy_setopt(curl, CURLOPT_WRITEDATA, NULL);*/
+    
+    res = curl_easy_perform(curl);
+    if(res != CURLE_OK)
+    {
+        //http_msg("curl_easy_perform[%d] error", res);
+        char err[50]={0};
+	sprintf(err,"curl_easy_perform:%d,size:%d error",res,image_size);
+	Send_Log((const char *)err,0x0301);
+        curl_easy_cleanup(curl);
+        curl_formfree(post);
+        curl_slist_free_all(chunk);
+        return -1;
+    }
+    
+    //http_msg("http post success:filename:%s,ip:%s,port:%d,image_size:%d,is_recording:%d",filename,ip,port,image_size,is_recording);
+    curl_easy_cleanup(curl);
+    curl_formfree(post);
+    curl_slist_free_all(chunk);
+    return 0;
+}
+   
+
+int  D_HttpPostPicture(int timestamp,char* image_buffer, long image_size, int image_type)
+{
+    char token[DEVICE_TOKEN_SIZE] = {0};
+    int token_len = D_GetDeviceToken(token, sizeof(token));
+    if (token_len == -1)
+        return -1;
+   
+    //cmsprintf("post image type: %d\n",image_type); 
+    char post_url[500];
+    memset(post_url,0,sizeof(post_url));
+    //sprintf(post_url,"http://%s:%d/API/cameras/%s/images/upload",platform_global_config.web_server_ip,platform_global_config.web_server_port,platform_global_config.hashid);
+
+    sprintf(post_url,"http://%s:%d/API/cameras/%s/images/upload",platform_global_config.web_server_ip,platform_global_config.web_server_port,platform_global_config.hashid);
+    //recording 
+    if(image_type == 1)
+    {
+	int ret=-1,i=0;
+	char server_ip[50]={0};
+	
+	//post public image
+	if(LY_PublicLiveFlag)
+    	{
+    		//printf("post device updata pic url:%s\n",post_url);
+		ret = http_post_file(token,post_url,timestamp, 2,image_buffer,image_size);
+		//ret = http_post_file(token,platform_global_config.web_server_ip,platform_global_config.web_server_port,platform_global_config.cid,timestamp, 2,image_buffer,image_size);
+		if((timestamp - LYRecording_Timestamp) >= 300)
+		{
+			LYRecording_Timestamp = (long)timestamp;
+		}
+		else
+			return ret;
+	}
+
+	//post recording image
+    	memset(post_url,0,sizeof(post_url));
+    	sprintf(post_url,"http://%s/API/cameras/%s/images/upload",platform_global_config.rtmp_record_imgAddr,platform_global_config.hashid);
+
+	for(i=0; i<5; i++)
+	{
+    		//printf("post device recording pic url:%s\n",post_url);
+		//shenzhen
+    		//ret =  http_post_file(token,"120.24.86.37",8005,platform_global_config.cid,timestamp, image_type,image_buffer,image_size);
+    		ret =  http_post_file(token,post_url,timestamp, image_type,image_buffer,image_size);
+    		if(ret == 0)
+			break;
+		else
+			sleep(1);
+	}
+	return ret;
+    }
+    else
+    {
+    	//printf("post device updata pic url:%s\n",post_url);
+    	//return http_post_file(token,platform_global_config.web_server_ip,platform_global_config.web_server_port,platform_global_config.cid,timestamp, image_type,image_buffer,image_size);
+    	return http_post_file(token,post_url,timestamp, image_type,image_buffer,image_size);
+    }
+}
+
+
+int httppostRTMPURL(char* ip,int port,char *token,char *rtmpUrl,int isremove)
+{
+    CURL *curl = NULL;
+    CURLcode res;
+    
+    struct curl_httppost *post=NULL;
+    struct curl_httppost *last=NULL;
+    
+    if( ip == NULL)
+    {
+        Send_Log("httppost ip = null",0x0301);
+        return -1;
+    }
+    
+    char post_url[500];
+    memset(post_url,0,sizeof(post_url));
+    if (isremove == 1)
+        sprintf(post_url,"http://%s:%d/API/cameras/public/%s/addr/remove",ip,port,platform_global_config.hashid);
+    else
+        sprintf(post_url,"http://%s:%d/API/cameras/public/addr",ip,port);
+    //printf("======param ========= :%s %s %d %s %d\n",post_url,hashID,strlen(hashID),rtmpUrl,strlen(rtmpUrl));
+   
+    char *Rtmp_json = NULL;
+    cJSON * root = NULL;
+    /* Add simple file section */    
+    if (isremove == 0)
+    {
+    	/*json root*/
+    	root=cJSON_CreateObject();
+    	/*json of rtmp url.*/
+    	cJSON_AddStringToObject(root, "cid", platform_global_config.hashid);
+    	cJSON_AddStringToObject(root, "rtmp", rtmpUrl);
+    	cJSON_AddStringToObject(root, "type", "camera");
+
+    	/*json output.*/
+    	Rtmp_json = cJSON_PrintUnformatted(root);
+    }
+   //printf("----- josn:%s\n",Rtmp_json); 
+    curl = curl_easy_init();
+    if(curl == NULL)
+    {
+        Send_Log("curl_easy_init() error\n",0x0301);
+        return -1;
+    }
+    
+    /* set http header */
+    struct  curl_slist*   chunk = NULL;//init to NULL
+    char x_camera_token[DEVICE_TOKEN_SIZE]={0};
+    sprintf(x_camera_token,"X-Camera-Token: %s",token);
+
+    /* Add header X-Camera-Token */
+    chunk = curl_slist_append(chunk, x_camera_token);
+
+    /* Modify header Content-Type */ 
+    chunk = curl_slist_append(chunk, "Content-Type: application/json; charset=utf-8");
+ 
+    curl_easy_setopt(curl,CURLOPT_HTTPHEADER, chunk);
+    
+    if (isremove == 0)
+    { 
+    	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, Rtmp_json);
+    	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(Rtmp_json));
+    }
+    else
+    	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0);
+	
+    //curl_easy_setopt(curl, CURLOPT_HEADER, 0);
+    curl_easy_setopt(curl, CURLOPT_URL, post_url); /*Set URL*/
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, platform_global_config.web_server_timeout);
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 0);	 //CURLOPT_VERBOSE:设置为非0表示打印出请求信息
+    curl_easy_setopt(curl, CURLOPT_POST, 1);	//CURLOPT_POST: 设置为非0表示本次操作为POST
+    
+    char err[62]={0};
+    res = curl_easy_perform(curl);
+    if(res != CURLE_OK)
+    {
+	printf("========= curl_easy_perform error =========\n");
+	memset(err,0,62);
+	sprintf(err,"post url curl_easy_perform:%d,err",res);
+	Send_Log((const char *)err,0x0301);
+        curl_easy_cleanup(curl);
+        curl_slist_free_all(chunk);
+        return -1;
+    }
+    
+    memset(err,0,62);
+    sprintf(err,"post url id:%s",platform_global_config.hashid);
+    Send_Log((const char *)err,0x0301);
+    //printf("http post success:ip:%s,port:%d,hashID:%s,url:%s\n",ip,port,hashID,rtmpUrl);
+    curl_easy_cleanup(curl);
+    curl_slist_free_all(chunk);
+    if (isremove == 0)
+    {
+    	cJSON_Delete(root);
+    	free(Rtmp_json);
+    	Rtmp_json = NULL;
+    }
+    return 0;
+}
+
+int HttpPostRTMPURL(char aMode)
+{
+    char token[DEVICE_TOKEN_SIZE] = {0};
+    int token_len = D_GetDeviceToken(token, sizeof(token));
+    if (token_len == -1)
+        return -1;
+
+    int nRet = -1;
+    if((aMode == 0x02) || (aMode == 0x04))
+    {
+    	char url[60];
+    	memset(url,0,60);
+    	sprintf(url,"rtmp://rtmp.public.topvdn.cn:1935/live/%d",platform_global_config.cid);
+    	nRet = httppostRTMPURL(platform_global_config.web_server_ip,platform_global_config.web_server_port,token,url,0);
+    }
+    else
+    	nRet = httppostRTMPURL(platform_global_config.web_server_ip,platform_global_config.web_server_port,token,platform_global_config.rtmp_url,0);
+    
+    //printf("SDK:D_HttpPostRTMPURL httppost return:%d\n",nRet);
+	
+    return nRet;
+}
+
+int HttpRemoveRTMPURL()
+{
+    char token[DEVICE_TOKEN_SIZE] = {0};
+    int token_len = D_GetDeviceToken(token, sizeof(token));
+    if (token_len == -1)
+        return -1;
+    	
+    int nRet = httppostRTMPURL(platform_global_config.web_server_ip,platform_global_config.web_server_port,token,platform_global_config.rtmp_url,1);
+
+    return nRet;
+}
+
+int httppost(char* ip,int port,char *hashID,char *rtmpUrl,int isremove)
+{
+    CURL *curl = NULL;
+    CURLcode res;
+    
+    struct curl_httppost *post=NULL;
+    struct curl_httppost *last=NULL;
+    
+    if( ip == NULL)
+    {
+        Send_Log("httppost ip = null",0x0301);
+        return -1;
+    }
+    
+    char post_url[500];
+    memset(post_url,0,sizeof(post_url));
+    if (isremove == 1)
+        sprintf(post_url,"http://%s:%d/API/rtmp/%s/addr/remove",ip,port,hashID);
+    else
+        sprintf(post_url,"http://%s:%d/API/rtmp/addr",ip,port);
+    
+    /* Add simple file section */
+    
+    //printf("======param ========= :%s %s %d %s %d\n",post_url,hashID,strlen(hashID),rtmpUrl,strlen(rtmpUrl));
+    
+    if (isremove == 0)
+    {
+        if(curl_formadd(&post, &last, CURLFORM_COPYNAME, "hash_cid",CURLFORM_PTRCONTENTS,hashID,CURLFORM_CONTENTSLENGTH,strlen(hashID), CURLFORM_END) != 0)
+        {
+            Send_Log("curl_formadd hash_cid error\n",0x0301);
+            curl_formfree(post);
+            return -1;
+        }
+        
+        if(curl_formadd(&post, &last, CURLFORM_COPYNAME, "addr",CURLFORM_PTRCONTENTS,rtmpUrl,CURLFORM_CONTENTSLENGTH,strlen(rtmpUrl), CURLFORM_END) != 0)
+        {
+            Send_Log("curl_formadd addr error\n",0x0301);
+            curl_formfree(post);
+            return -1;
+        }
+    }
+    
+    
+    curl = curl_easy_init();
+    if(curl == NULL)
+    {
+        Send_Log("curl_easy_init() error\n",0x0301);
+        curl_formfree(post);
+        return -1;
+    }
+    
+    curl_easy_setopt(curl, CURLOPT_HEADER, 0);
+    curl_easy_setopt(curl, CURLOPT_URL, post_url); /*Set URL*/
+    curl_easy_setopt(curl, CURLOPT_HTTPPOST, post);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, platform_global_config.web_server_timeout);
+    
+    char err[62]={0};
+    res = curl_easy_perform(curl);
+    if(res != CURLE_OK)
+    {
+	memset(err,0,62);
+	sprintf(err,"post url curl_easy_perform:%d,err",res);
+	Send_Log((const char *)err,0x0301);
+        curl_easy_cleanup(curl);
+        curl_formfree(post);
+        return -1;
+    }
+    
+    memset(err,0,62);
+    sprintf(err,"post url id:%s",hashID);
+    Send_Log((const char *)err,0x0301);
+    //printf("http post success:ip:%s,port:%d,hashID:%s,url:%s\n",ip,port,hashID,rtmpUrl);
+    curl_easy_cleanup(curl);
+    curl_formfree(post);
+    return 0;
+}
+    
+
+//int http_post_message(char* ip,int port,char *token, char* msg_buffer, long msg_size)
+int http_post_jsonData(char *token, char *post_url, char *msg_buffer, long msg_size)
+{
+    CURL *curl = NULL;
+    CURLcode res;
+
+    /*struct curl_httppost *post=NULL;*/
+    /*struct curl_httppost *last=NULL;*/
+    if(token ==NULL || msg_buffer == NULL || post_url == NULL)
+    {
+        Send_Log("post_msg token or msg or ip == NULL",0x0301);
+	return -1;
+    }
+    
+//    char post_url[500];
+//    memset(post_url,0,sizeof(post_url));
+//    sprintf(post_url,"http://%s:%d/API/message/cameras/touser",ip,port);
+    //http://121.41.118.167:8006/API/message/cameras/touser   
+ 
+    
+    curl = curl_easy_init();
+    if(curl == NULL)
+    {
+	Send_Log("curl_msg_init() error",0x0301);
+        /*curl_formfree(post);*/
+        return -1;
+    }
+
+    /* set http header */
+    struct  curl_slist*   chunk = NULL;//init to NULL
+    char x_camera_token[DEVICE_TOKEN_SIZE]={0};
+    sprintf(x_camera_token,"X-Camera-Token: %s",token);
+
+    /* Add header X-Camera-Token */
+    chunk = curl_slist_append(chunk, x_camera_token);
+
+    /* Modify header Content-Type */ 
+    chunk = curl_slist_append(chunk, "Content-Type: application/json; charset=utf-8");
+ 
+    /* Remove header Expect */
+    chunk = curl_slist_append(chunk, "Expect:");
+
+    curl_easy_setopt(curl,CURLOPT_HTTPHEADER, chunk);
+
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, msg_buffer);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, msg_size);
+    /*curl_easy_setopt(curl, CURLOPT_HEADER, 0);*/
+    curl_easy_setopt(curl, CURLOPT_URL, post_url); /*Set URL*/
+    /*curl_easy_setopt(curl, CURLOPT_HTTPPOST, post);*/
+    /*curl_easy_setopt(curl, CURLOPT_POST, 1);	//CURLOPT_POST: 设置为非0表示本次操作为POST*/
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, platform_global_config.web_server_timeout);
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 0);// 0:not printf the http reply ; 1:print the http reply
+    /*curl_easy_setopt(curl, CURLOPT_WRITEDATA, NULL);*/
+    
+    res = curl_easy_perform(curl);
+    if(res != CURLE_OK)
+    {
+        char err[50]={0};
+	sprintf(err,"curl_json_perform:%d,size:%d error",res,msg_size);
+	Send_Log((const char *)err,0x0301);
+        curl_easy_cleanup(curl);
+        /*curl_formfree(post);*/
+        /* free the custom headers */ 
+        curl_slist_free_all(chunk);
+        return -1;
+    }
+    
+    curl_easy_cleanup(curl);
+    /*curl_formfree(post);*/
+    /* free the custom headers */ 
+    curl_slist_free_all(chunk);
+    return 0;
+}
+    
+
+int getMessageJson(int aCid, char *aMessage, int is_callServer, char * json, unsigned int json_size)
+{
+    char *out = NULL;
+    int out_len = 0;
+    /*char hashID[50];*/
+    /*memset(hashID,0,50);*/
+    /*GetDwordHash(aCid,hashID);*/
+    /*char hash[50];*/
+    /*memset(hash,0,50);*/
+    /*int i;*/
+    /*for(i=0;i<8;i++)*/
+    /*{*/
+        /*sprintf(hash+i*2,"%02X",(unsigned char )hashID[i]);*/
+    /*}*/
+    /*printf("hashid :%s, len:%d\n",hash,strlen(hash));*/
+
+
+    /*json root*/
+    cJSON * root=cJSON_CreateObject();
+    /*json of timestamp.*/
+    //cJSON_AddItemToObject(root, "report", json_report);
+    cJSON_AddStringToObject(root, "from", platform_global_config.hashid);
+    cJSON_AddStringToObject(root, "msg", aMessage);
+    cJSON_AddNumberToObject(root, "callback", is_callServer?1:0);
+    // callback是整数不是字符串
+
+    /*json output.*/
+    out=cJSON_PrintUnformatted(root);
+    out_len=strlen(out);
+    if (json != NULL && json_size >= out_len) {
+        memcpy(json, out, out_len);
+        cJSON_Delete(root);
+        free(out);
+	out = NULL;
+        return 0;
+    }
+    
+    cJSON_Delete(root);
+    free(out);
+    out = NULL;
+    return -1;
+}
+
+int   D_PushMessage(const char *aMessage, unsigned int aMessageLen, int is_callServer)
+{
+    int ret = -1;
+    /*printf("msg= %d %d %d %d %d %d, len=%d\n",aMessage[0],aMessage[1],aMessage[2],aMessage[3],aMessage[4],aMessage[5],aMessageLen);*/
+    char token[DEVICE_TOKEN_SIZE] = {0};
+    int token_len = D_GetDeviceToken(token, sizeof(token));
+    if (token_len == -1)
+        return -1;
+
+    char message[MAX_MESSAGE_B64_BUFFER];
+    unsigned int length = sizeof(message);
+    if (aMessageLen > MAX_MESSAGE_SIZE) {
+        aMessageLen = MAX_MESSAGE_SIZE;
+    }
+    if (NULL == b64encode((const unsigned char*)aMessage, aMessageLen, message, &length)) {
+        Send_Log("push msg b64ecode failed",0x0301);
+        return -1;
+    }
+    char msg_json[512]={0};
+    ret = getMessageJson(platform_global_config.cid, message, is_callServer, msg_json, (unsigned int)sizeof(msg_json));
+    if(ret != 0) {
+        return ret;
+    }
+
+    //printf("msg json:%s, len:%d\n",msg_json,strlen(msg_json));
+    char post_url[500];
+    memset(post_url,0,sizeof(post_url));
+    sprintf(post_url,"http://%s:%d/API/message/cameras/touser",platform_global_config.web_server_ip,platform_global_config.web_server_port);
+    //http://121.41.118.167:8006/API/message/cameras/touser   
+
+    ret = http_post_jsonData(token, post_url,  msg_json, strlen(msg_json));
+    
+    return ret;
+}
+
+int   D_SetDeviceConfig(const char *aConfig, unsigned int aConfigLen)
+{
+    int ret = -1;
+    /*printf("msg= %d %d %d %d %d %d, len=%d\n",aMessage[0],aMessage[1],aMessage[2],aMessage[3],aMessage[4],aMessage[5],aMessageLen);*/
+    char token[DEVICE_TOKEN_SIZE] = {0};
+    int token_len = D_GetDeviceToken(token, sizeof(token));
+    if (token_len == -1)
+        return -1;
+
+    char config[MAX_MESSAGE_B64_BUFFER];
+    unsigned int length = sizeof(config);
+    if (aConfigLen > MAX_MESSAGE_SIZE) {
+        aConfigLen = MAX_MESSAGE_SIZE;
+    }
+    if (NULL == b64encode((const unsigned char*)aConfig, aConfigLen, config, &length)) {
+        Send_Log("set_dev_cfg b64ecode failed",0x0301);
+        return -1;
+    }
+
+    /*json root*/
+    cJSON * root=cJSON_CreateObject();
+    /*json of timestamp.*/
+    cJSON_AddStringToObject(root, "cid", platform_global_config.hashid);
+    cJSON_AddStringToObject(root, "config", config);
+
+    /*json output.*/
+    char *cfg_json=cJSON_PrintUnformatted(root);
+    if (NULL == cfg_json) {
+        cJSON_Delete(root);
+        return -1;
+    }
+    
+    //printf("msg json:%s, len:%d\n",msg_json,strlen(msg_json));
+    char post_url[500];
+    memset(post_url,0,sizeof(post_url));
+    sprintf(post_url,"http://%s:%d/API/cameras/configs",platform_global_config.web_server_ip,platform_global_config.web_server_port);
+    //http://121.41.118.167:8006/API/message/cameras/touser   
+
+    ret = http_post_jsonData(token, post_url,  cfg_json, strlen(cfg_json));
+
+    if (cfg_json) {
+        cJSON_Delete(root);
+	free(cfg_json);
+	cfg_json = NULL;
+    }
+    return ret;
+}
+
+int   D_SetDeviceExtraFields(const char *aData, unsigned int aDataLen)
+{
+    int ret = -1;
+    /*printf("msg= %d %d %d %d %d %d, len=%d\n",aMessage[0],aMessage[1],aMessage[2],aMessage[3],aMessage[4],aMessage[5],aMessageLen);*/
+    char token[DEVICE_TOKEN_SIZE] = {0};
+    int token_len = D_GetDeviceToken(token, sizeof(token));
+    if (token_len == -1)
+        return -1;
+
+#if 0
+    char config[MAX_MESSAGE_B64_BUFFER];
+    unsigned int length = sizeof(config);
+    if (aDataLen > MAX_MESSAGE_SIZE) {
+        aDataLen = MAX_MESSAGE_SIZE;
+    }
+    if (NULL == b64encode((const unsigned char*)aData, aDataLen, config, &length)) {
+        Send_Log("set_dev_cfg b64ecode failed",0x0301);
+        return -1;
+    }
+#endif
+
+    /*json root*/
+    cJSON * root=cJSON_CreateObject();
+#if 0
+    /*json of extra data.*/
+    cJSON_AddStringToObject(root, "extra", config);
+#else
+    cJSON_AddStringToObject(root, "extra", aData);
+#endif
+
+    /*json output.*/
+    char *cfg_json=cJSON_PrintUnformatted(root);
+    if (NULL == cfg_json) {
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    
+    //printf("msg json:%s, len:%d\n",msg_json,strlen(msg_json));
+    char post_url[500];
+    memset(post_url,0,sizeof(post_url));
+    sprintf(post_url,"http://%s:%d/API/cameras/%s/extra",platform_global_config.web_server_ip,platform_global_config.web_server_port,platform_global_config.hashid);
+
+    ret = http_post_jsonData(token, post_url,  cfg_json, strlen(cfg_json));
+
+    if (cfg_json) {
+        cJSON_Delete(root);
+	free(cfg_json);
+	cfg_json = NULL;
+    }
+    return ret;
+}
+
+
+int  D_GetDevHashID(unsigned long aSrcCid, char *apHashBuffer,int HashIdLength)
+{
+	if((aSrcCid == 0) || (apHashBuffer == NULL))
+		return -1;
+
+	char hashID[50];
+        memset(hashID,0,50);
+	GetDwordHash(aSrcCid, hashID);
+        char hash[50];
+        memset(hash,0,50);
+        int i;
+        for(i=0;i<8;i++)
+        {
+                sprintf(hash+i*2,"%02X",(unsigned char )hashID[i]);
+        }
+        printf("hashid :%s, len:%d\n",hash,strlen(hash));
+	int len = strlen(hash);
+	
+
+	if(HashIdLength < len)
+		return -1;
+	
+	strncpy(apHashBuffer,hash,len);
+
+	return len;
+}

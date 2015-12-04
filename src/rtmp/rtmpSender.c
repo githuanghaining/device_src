@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
-
+#include "rtmpcommon.h"
 #include "log.h"
 #include "rtmpSender.h"
 #include "platform_cfg.h"
@@ -15,10 +15,12 @@
 #endif
 #ifndef NETPUSH
 #ifndef WIN32
+
 void Sys_Sleep(DWORD aMilliseconds)
 {
     usleep(aMilliseconds*1000);
 }
+
 DWORD Sys_GetTickCount(void) 
 {
     struct timeval aika;
@@ -27,17 +29,29 @@ DWORD Sys_GetTickCount(void)
     msecs += (aika.tv_usec / 1000);
     return msecs;
 }
+
+DWORD64 Sys_MicroSeconds(void) 
+{
+	struct timeval aika;
+	gettimeofday(&aika,NULL);
+	unsigned long long tmp_sec = aika.tv_sec;
+	unsigned long long tmp_usec = aika.tv_usec;
+	unsigned long long msecs = tmp_sec * 1000 *1000;
+	msecs += tmp_usec;
+	return msecs;
+}
+
 #endif
 #endif
 
-char RTMP_Enable_AES128 =0x00;
-unsigned int RTMP_C_BitRate = 0;
-unsigned int RTMP_C_FrameRate = 0;
 
 typedef struct RtmpContexStruct
 {
 	RTMP *pRtmp;
-	DWORD StartTime;
+	DWORD64 StartTime;
+	DWORD64 First_Iframe_Time;
+	int reSend_sps_pps_flag;
+	int first_recv_iframe_flag;
 	int spslen;
 	int ppsLen;
 	char spsBuf[100];
@@ -51,6 +65,9 @@ typedef struct RtmpContexStruct
 	int rtmp_body_size;
 	int rtmp_body_len;
 	char* body;
+	char device_type;
+	RTMPMetaData  metaData;
+	char accessToken[TOKEN_SIZE];
 	pthread_mutex_t  RtmpMutex;
 } RtmpContex;
 
@@ -68,7 +85,9 @@ static RtmpContex* global_RtmpContex = NULL;
 static char rtmp_url[256];
 static int init_rtmp_contex_flag = 0;
 extern platform_config_t platform_global_config;
-
+char RTMP_Enable_AES128 =0x00;
+unsigned int RTMP_C_BitRate = 0;
+unsigned int RTMP_C_FrameRate = 0;
 
 
 #define HTON16(x)  ((x>>8&0xff)|(x<<8&0xff00))
@@ -160,6 +179,18 @@ void InitNet()
 }
 
 
+static void InitGlobalRtmpContex()
+{
+	if(init_rtmp_contex_flag == 0){
+		global_RtmpContex = (RtmpContex*)calloc(1,sizeof(RtmpContex));
+		global_RtmpContex->body = NULL;
+		global_RtmpContex->pRtmp = NULL;
+		pthread_mutex_init(&global_RtmpContex->RtmpMutex,NULL);
+		init_rtmp_contex_flag = 1;
+	}
+}
+
+
 static void sendUDP(char* ip,int port,char* data,int data_len)
 {
 	
@@ -206,23 +237,65 @@ void Send_Log(const char *msg, int cmd)
         	rtmp_msg.msg_cmd = 0x0301;
 	else if(cmd == (int)0x0302)
         	rtmp_msg.msg_cmd = 0x0302;
-	else
-	{
-		//printf("cdm error .......%x , %d\n",cmd,cmd);
-		return;
-	}
         memset(rtmp_msg.msg,0,sizeof(rtmp_msg.msg));
         snprintf(rtmp_msg.msg,sizeof(rtmp_msg.msg)-1,"%s",msg);
         sendUDP("120.26.74.53",80,(char*)&rtmp_msg,sizeof(rtmp_msg));
-	
-	//printf("cmd ====== %x, %x\n",cmd,rtmp_msg.msg_cmd);
 }
+
+
+void setToken(unsigned char* token)
+{
+	InitGlobalRtmpContex();
+	pthread_mutex_lock(&global_RtmpContex->RtmpMutex);
+	memset(global_RtmpContex->accessToken,0,sizeof(global_RtmpContex->accessToken));
+	strncpy(global_RtmpContex->accessToken,token,sizeof(global_RtmpContex->accessToken)-1);
+	pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
+}
+
+void setDeviceType(unsigned char type)
+{
+	InitGlobalRtmpContex();
+	global_RtmpContex->device_type= type; 
+}
+
+void setMetaData(RTMPMetaData meta_data)
+{
+	InitGlobalRtmpContex();
+	global_RtmpContex->metaData= meta_data; 
+}
+
+int getJPGServerIP(int fd)
+{
+        //RtmpContex *rCntx = GetRtmpContexWithFD(fd);
+        RtmpContex *rCntx = global_RtmpContex;
+	if(NULL == rCntx)
+        {
+                return -1;
+        }
+	pthread_mutex_lock(&rCntx->RtmpMutex);
+        if(rCntx->pRtmp == NULL){
+		pthread_mutex_unlock(&rCntx->RtmpMutex);
+                return -1;
+        }
+
+        if(RTMP_IsConnected(rCntx->pRtmp)){
+                RTMP_getServerIP(rCntx->pRtmp);
+		pthread_mutex_unlock(&rCntx->RtmpMutex);
+                return 0;
+        }
+	pthread_mutex_unlock(&rCntx->RtmpMutex);
+        return -1;
+}
+
 
 int ReConnectToRtmpServer(RtmpContex* apRtmpContex,const char* aUrl)
 {
 	RTMP_Init(apRtmpContex->pRtmp);//初始化rtmp设置
 	apRtmpContex->pRtmp->Link.timeout=5;//设置连接超时，单位秒，默认30秒
-	
+	apRtmpContex->pRtmp->device_type = apRtmpContex->device_type;
+	strncpy(apRtmpContex->pRtmp->accessToken,apRtmpContex->accessToken,sizeof(apRtmpContex->pRtmp->accessToken)-1);
+	apRtmpContex->pRtmp->metaData = apRtmpContex->metaData;
+
 	RTMP_SetupURL(apRtmpContex->pRtmp, aUrl);//设置url
 	RTMP_EnableWrite(apRtmpContex->pRtmp);//设置可写状态
 	if (!RTMP_Connect(apRtmpContex->pRtmp,NULL))
@@ -236,7 +309,7 @@ int ReConnectToRtmpServer(RtmpContex* apRtmpContex,const char* aUrl)
 		return -1;
 	}
 	//printf("ReConnectToRtmpServer:%s Succ",aUrl);
-	apRtmpContex->StartTime = Sys_GetTickCount();
+	apRtmpContex->StartTime = Sys_MicroSeconds();
 	return 0;
 }
 
@@ -315,6 +388,8 @@ static void reset_audio_thread_flag()
 void *recv_audio(void)
 {
 	while(!global_RtmpContex->stop_audio_thread_flag){
+		//pthread_t tid = pthread_self();
+		//printf("audio start ..........tid= %d\n",tid);
 		pthread_mutex_lock(&global_RtmpContex->RtmpMutex);
 
 		if(global_RtmpContex->pRtmp == NULL){
@@ -348,7 +423,8 @@ void *recv_audio(void)
 		usleep(40000);
 		continue;
 		#endif
-		
+		//printf("======= begain =========\n");	
+	
 		if(global_RtmpContex->audio_data_recv_status == 0){
 			pthread_mutex_lock(&global_RtmpContex->RtmpMutex);
 			if(global_RtmpContex->pRtmp == NULL){
@@ -357,7 +433,6 @@ void *recv_audio(void)
 				continue;
 			}
 			int nRead = tcp_recv_noblock1(global_RtmpContex->pRtmp->m_sb.sb_socket,global_RtmpContex->rtmp_head+global_RtmpContex->rtmp_head_len,8-global_RtmpContex->rtmp_head_len);
-			//printf("00000000 nRead:%d\n",nRead);
 			pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
 			if(nRead == -1)
 			{
@@ -403,7 +478,7 @@ void *recv_audio(void)
 			if(global_RtmpContex->body == NULL){
 				global_RtmpContex->body = (char*)calloc(1,global_RtmpContex->rtmp_body_size);
 			}
-			//printf("111111111111 body_size:%d\n",body_size);
+			//printf("111111111111 type:%d, body_size:%d\n",type,body_size);
 		}
 
 
@@ -415,7 +490,7 @@ void *recv_audio(void)
 				continue;
 			}
 			int nRead = tcp_recv_noblock1(global_RtmpContex->pRtmp->m_sb.sb_socket,global_RtmpContex->body+global_RtmpContex->rtmp_body_len,global_RtmpContex->rtmp_body_size-global_RtmpContex->rtmp_body_len);
-			//printf("222222 read:%d,pRtmpContex->rtmp_body_len:%d pRtmpContex->rtmp_body_size:%d \n",nRead,pRtmpContex->rtmp_body_len,pRtmpContex->rtmp_body_size);
+			//printf("222222 read:%d,pRtmpContex->rtmp_body_len:%d pRtmpContex->rtmp_body_size:%d \n",nRead,global_RtmpContex->rtmp_body_len,global_RtmpContex->rtmp_body_size);
 			pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
 			if(nRead == -1)
 			{
@@ -430,7 +505,7 @@ void *recv_audio(void)
 			
 			global_RtmpContex->rtmp_body_len += nRead;
 
-			//printf("222222222 rtmp_body_len:%d,rtmp_body_size:%d\n",pRtmpContex->rtmp_body_len,pRtmpContex->rtmp_body_size);
+			//printf("222222222 rtmp_body_len:%d,rtmp_body_size:%d\n",global_RtmpContex->rtmp_body_len,global_RtmpContex->rtmp_body_size);
 			if(global_RtmpContex->rtmp_body_len == global_RtmpContex->rtmp_body_size){
 				if(global_RtmpContex->fun){
 					global_RtmpContex->fun(1,global_RtmpContex->body,global_RtmpContex->rtmp_body_size);
@@ -442,6 +517,7 @@ void *recv_audio(void)
 		}
 
 		if(global_RtmpContex->audio_data_recv_status == 3){
+			//printf(" 333333333 status ======= 3\n");
 			pthread_mutex_lock(&global_RtmpContex->RtmpMutex);
 			if(global_RtmpContex->pRtmp == NULL){
 				reset_audio_thread_flag();
@@ -465,7 +541,11 @@ void *recv_audio(void)
 			if(global_RtmpContex->rtmp_body_len == global_RtmpContex->rtmp_body_size){
 				if(global_RtmpContex->fun){
 					if(global_RtmpContex->rtmp_body_size > 6)
-						global_RtmpContex->fun(2,global_RtmpContex->body+6,global_RtmpContex->rtmp_body_size-6);
+						if(*(global_RtmpContex->body+4) == 0x00 && *(global_RtmpContex->body+5) == 0x29)        //disk info
+							global_RtmpContex->fun(2,global_RtmpContex->body+6,global_RtmpContex->rtmp_body_size-6);
+						else if(*(global_RtmpContex->body+4) == 0x00 && *(global_RtmpContex->body+5) == 0x47)   //jpeg server addr
+							global_RtmpContex->fun(3,global_RtmpContex->body+6,global_RtmpContex->rtmp_body_size-6);
+							
 				}
 				reset_audio_thread_flag();
 			}
@@ -474,6 +554,7 @@ void *recv_audio(void)
 		}
 		
 	}
+
 	pthread_exit(0);
 	return NULL;
 }
@@ -502,17 +583,14 @@ int ConnectToRtmpServer(const char* aUrl,audio_consume_pt fun,int recv_audio_fla
 {
 	RTMP_LogLevel lvl=RTMP_LOGDEBUG;
 
-	if(init_rtmp_contex_flag == 0){
-		global_RtmpContex = (RtmpContex*)calloc(1,sizeof(RtmpContex));
-		global_RtmpContex->body = NULL;
-		global_RtmpContex->pRtmp = NULL;
-		pthread_mutex_init(&global_RtmpContex->RtmpMutex,NULL);
-		init_rtmp_contex_flag = 1;
-	}
+	InitGlobalRtmpContex();
 	
 	memset(rtmp_url,0,sizeof(rtmp_url));
 	global_RtmpContex->fun = fun;
 	global_RtmpContex->recv_audio_flag = recv_audio_flag;
+	global_RtmpContex->first_recv_iframe_flag= 1;
+	global_RtmpContex->reSend_sps_pps_flag= 0;
+	global_RtmpContex->First_Iframe_Time = 0;
 	global_RtmpContex->stop_audio_thread_flag = 0;
 	global_RtmpContex->audio_data_recv_status = 0;
 	global_RtmpContex->rtmp_head_len= 0;
@@ -535,6 +613,12 @@ int ConnectToRtmpServer(const char* aUrl,audio_consume_pt fun,int recv_audio_fla
 	global_RtmpContex->pRtmp=RTMP_Alloc();//申请rtmp空间
 	RTMP_Init(global_RtmpContex->pRtmp);//初始化rtmp设置
 	global_RtmpContex->pRtmp->Link.timeout=5;//设置连接超时，单位秒，默认30秒
+	global_RtmpContex->pRtmp->device_type = global_RtmpContex->device_type;
+
+	pthread_mutex_lock(&global_RtmpContex->RtmpMutex);
+	strncpy(global_RtmpContex->pRtmp->accessToken,global_RtmpContex->accessToken,sizeof(global_RtmpContex->pRtmp->accessToken)-1);
+	global_RtmpContex->pRtmp->metaData = global_RtmpContex->metaData;
+	pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
 	
 	//modify by suwei
 	//int connect_count = 3600;
@@ -580,15 +664,15 @@ int ConnectToRtmpServer(const char* aUrl,audio_consume_pt fun,int recv_audio_fla
 		return -1;
 	}
 
-	//printf("ConnectToRtmpServer:%s Succ\n",aUrl);
-	global_RtmpContex->StartTime = Sys_GetTickCount();
+	printf("ConnectToRtmpServer:%s Succ\n",aUrl);
+	global_RtmpContex->StartTime = Sys_MicroSeconds();
 
 	if(global_RtmpContex->recv_audio_flag){
 		int ret = pthread_create(&audio_recv_thread, NULL, (void *)recv_audio, NULL);
-       		if(ret != 0) 
-       		{
+   		if(ret != 0) 
+   		{
 			send_msg("audio recv thread create failed");
-       		}          
+   		}          
   
 	}
 
@@ -620,13 +704,21 @@ int ConnectToRtmpServer(const char* aUrl,audio_consume_pt fun,int recv_audio_fla
 
 void DisconnectRtmpServer()
 {
+	global_RtmpContex->stop_audio_thread_flag = 1;
 	pthread_mutex_lock(&global_RtmpContex->RtmpMutex);
 	if(global_RtmpContex->pRtmp != NULL){
 		RTMP_Close(global_RtmpContex->pRtmp);
-    	RTMP_Free(global_RtmpContex->pRtmp);
+		RTMP_Free(global_RtmpContex->pRtmp);
 		global_RtmpContex->pRtmp = NULL;
+		printf("DisconnectRtmpServer ---------------- 11111\n");
+		pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
+		int r = pthread_cancel(audio_recv_thread);
+		printf("pthread_cancel: %d\n", r);
+		pthread_join(audio_recv_thread,0);
+		printf("DisconnectRtmpServer ---------------- 222222\n");
 		send_msg("DisconnectRtmpServer");
-	}
+		printf("DisconnectRtmpServer ---------------- 333333\n");
+	} else
 	pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
 }
 
@@ -677,18 +769,17 @@ static int ReSendSPSPPS(RtmpContex* apRtmpContex,unsigned int aTimeStamp)
 
 
 
-static int SendRtmpPacket(RtmpContex* apRtmpContex,const char* aBodyBuffer, int aBodyBufferLength, int aType, unsigned int aTimeStamp,int frame_type)
+//static int SendRtmpPacket(RtmpContex* apRtmpContex,const char* aBodyBuffer, int aBodyBufferLength, int aType, unsigned int aTimeStamp,int frame_type)
+static int SendRtmpPacket(RtmpContex* apRtmpContex,const char* aBodyBuffer, int aBodyBufferLength, int aType, DWORD64 aTimeStamp,int frame_type)
 {
+	int nRet = -1;
 	if(!RTMP_IsConnected(apRtmpContex->pRtmp)){
-		if(frame_type != 2)
-			return 0;
-		
 		if(ReConnectToRtmpServer(apRtmpContex,(const char *)rtmp_url) !=0)
 		{
 			char msg_buffer[64]={0};
 			snprintf(msg_buffer,sizeof(msg_buffer)-1,"rc %s,local:%s failed",global_RtmpContex->pRtmp->server_ip,global_RtmpContex->pRtmp->local_ip);
 			send_msg(msg_buffer);
-			return 0;
+			return 2;	//network status
 		}
 		else
 		{
@@ -697,15 +788,63 @@ static int SendRtmpPacket(RtmpContex* apRtmpContex,const char* aBodyBuffer, int 
 			send_msg(msg_buffer);
 		}
 		
-		ReSendSPSPPS(apRtmpContex,aTimeStamp);
+		global_RtmpContex->reSend_sps_pps_flag= 1;
 	}
+
+	//make sure first frame is IFrame
+	if(global_RtmpContex->First_Iframe_Time == 0){
+		printf("rtmp send First_Iframe_Time == 0 \n");
+		return -1;
+	}
+
+	//discard too old frame 
+	if(aTimeStamp < global_RtmpContex->StartTime){
+		if((global_RtmpContex->StartTime-aTimeStamp) >= 2000*1000)
+		{
+			char msg[64]={0};
+			sprintf(msg,"Ts - Tc : %u",(global_RtmpContex->StartTime-aTimeStamp)/1000);
+			//printf("discard old frame first time:%llu, absolute time:%llu, start time:%llu, info:%s\n",
+			//	global_RtmpContex->First_Iframe_Time,aTimeStamp,global_RtmpContex->StartTime,msg);
+			//send_msg(msg);
+			return -1;
+		}
+	}
+
+	unsigned int curTimestamp = (aTimeStamp - global_RtmpContex->First_Iframe_Time)/1000;
+	curTimestamp = curTimestamp%0xFFFFFE;
+	if(global_RtmpContex->reSend_sps_pps_flag)
+	{
+		//when reconnect,make sure fisrt frame is IFrame
+		if(frame_type != 2)
+		{
+			//printf("send rtmp frame_type != 2 \n");
+			return -1;
+		}	
+
+		global_RtmpContex->reSend_sps_pps_flag = 0;	
+		printf("reconnect success ,resend sps pps curTimestamp:%u\n",curTimestamp);
+		nRet = ReSendSPSPPS(apRtmpContex,curTimestamp);
+		char msg_buffer[64]={0};
+		snprintf(msg_buffer,sizeof(msg_buffer)-1,"rc tm:%llu st:%llu %lu",aTimeStamp,global_RtmpContex->StartTime,curTimestamp);
+		send_msg(msg_buffer);
+	}
+	else
+	{
+		//send sps before send IFrame
+		if(frame_type == 2)
+			ReSendSPSPPS(apRtmpContex,curTimestamp);
+	}
+
+
+	//printf("first time:%llu, absolute time:%llu, start time:%llu,relative time:%u, type:%d, len:%d\n",
+	//	global_RtmpContex->First_Iframe_Time,aTimeStamp,global_RtmpContex->StartTime,curTimestamp,frame_type,aBodyBufferLength);
 
 	RTMPPacket packet;//创建包
 	RTMPPacket_Reset(&packet);//重置packet状态
 	RTMPPacket_Alloc(&packet,aBodyBufferLength+1);//给packet分配数据空间
 	packet.m_packetType = aType;
 	packet.m_nBodySize = aBodyBufferLength;
-	packet.m_nTimeStamp = aTimeStamp;
+	packet.m_nTimeStamp = curTimestamp;
 	packet.m_nChannel = 0x04; //通道
 	packet.m_headerType = RTMP_PACKET_SIZE_LARGE; 
 	packet.m_nInfoField2 = apRtmpContex->pRtmp->m_stream_id;
@@ -718,34 +857,41 @@ static int SendRtmpPacket(RtmpContex* apRtmpContex,const char* aBodyBuffer, int 
 			char msg_buffer[64]={0};
 			snprintf(msg_buffer,sizeof(msg_buffer)-1,"send %s,local:%s failed",global_RtmpContex->pRtmp->server_ip,global_RtmpContex->pRtmp->local_ip);
 			send_msg(msg_buffer);
+			nRet = 2;		//network status
+		}
+		else
+		{
+			
+			nRet = 0;
 		}
 	}
+	else
+		nRet = 2;		//network status
 	
 	RTMPPacket_Free(&packet);
-	return 0;
+	return nRet;
 }
 
-int SendNal(const char *aNalBuf, DWORD aNalBufLen,DWORD time)
+//int SendNal(const char *aNalBuf, DWORD aNalBufLen,DWORD time)
+int SendNal(const char *aNalBuf, DWORD aNalBufLen,DWORD64 time)
 {
+	int nRet = -1;
 	char frame_type = aNalBuf[0] & 0x1f;
+	//printf("send nal type === %d\n",frame_type);
 	if(frame_type==6) //SEI
 	{
 	}
 	else if(frame_type==7)//SPS
 	{
-	//	if(global_RtmpContex->spslen == 0)
-	//	{
-			global_RtmpContex->spslen = aNalBufLen;
-			memcpy(global_RtmpContex->spsBuf, aNalBuf,global_RtmpContex->spslen);
-	//	}
+		global_RtmpContex->spslen = aNalBufLen;
+		memcpy(global_RtmpContex->spsBuf, aNalBuf,global_RtmpContex->spslen);
+		nRet = 0;
 	}
 	else if(frame_type==8)//PPS
 	{
-	//	if(global_RtmpContex->ppsLen == 0)
-	//	{
-			global_RtmpContex->ppsLen = aNalBufLen;
-			memcpy(global_RtmpContex->ppsBuf, aNalBuf, global_RtmpContex->ppsLen);
-	//	}
+		global_RtmpContex->ppsLen = aNalBufLen;
+		memcpy(global_RtmpContex->ppsBuf, aNalBuf, global_RtmpContex->ppsLen);
+		nRet = 0;
 	}
 	else
 	{
@@ -758,7 +904,7 @@ int SendNal(const char *aNalBuf, DWORD aNalBufLen,DWORD time)
 		pthread_mutex_lock(&global_RtmpContex->RtmpMutex);
 		if(global_RtmpContex->pRtmp == NULL){
 			pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
-			return 0;
+			return -1;
 		}
 		char* buf = (char*)malloc(buflen);
 		if(frame_type==5)
@@ -776,10 +922,6 @@ int SendNal(const char *aNalBuf, DWORD aNalBufLen,DWORD time)
 			buf[8]=0x05;
 		
 			buf[9]=0x06;
-			//buf[10]=0x11;
-			//buf[11]=0x22;
-			//buf[12]=0x33;
-			//buf[13]=0x44;
 			buf[10]=RTMP_Enable_AES128;
 			buf[11]=RTMP_C_FrameRate&0xFF;
 			buf[12]=RTMP_C_BitRate&0XFF;
@@ -801,66 +943,76 @@ int SendNal(const char *aNalBuf, DWORD aNalBufLen,DWORD time)
 		}
 		
 		if(frame_type==5){
-			ReSendSPSPPS(global_RtmpContex,time);
-			SendRtmpPacket(global_RtmpContex,buf, buflen, 9, time,2);		//Iframe
+			if(global_RtmpContex->first_recv_iframe_flag)
+			{
+				global_RtmpContex->First_Iframe_Time = time;	
+				global_RtmpContex->first_recv_iframe_flag = 0;	
+			}
+			nRet = SendRtmpPacket(global_RtmpContex,buf, buflen, 9, time,2);		//Iframe
 		}
 		else
-			SendRtmpPacket(global_RtmpContex,buf, buflen, 9, time,3);		//Pframe
+			nRet = SendRtmpPacket(global_RtmpContex,buf, buflen, 9, time,3);		//Pframe
 		
 		free(buf);
 		pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
 	}
-	return 1;
+	return nRet;
 }
 
-int SendAacInfo(const char *aAacInfoBuf, DWORD aAacInfoBufLen,DWORD time)
+//int SendAacInfo(const char *aAacInfoBuf, DWORD aAacInfoBufLen,DWORD time)
+int SendAacInfo(const char *aAacInfoBuf, DWORD aAacInfoBufLen,DWORD64 time)
 {
+	int nRet = -1;
 	char* buf = (char*)malloc(aAacInfoBufLen+2);
 	pthread_mutex_lock(&global_RtmpContex->RtmpMutex);
 	if(global_RtmpContex->pRtmp == NULL){
 		pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
-		return 0;
+		return -1;
 	}
 	buf[0] = 0xaf;
 	buf[1] = 0x00;
 	memcpy(buf+2,aAacInfoBuf,aAacInfoBufLen);
-	SendRtmpPacket(global_RtmpContex,buf, aAacInfoBufLen+2, 8,time,4);     //aac info type is 4
+	nRet = SendRtmpPacket(global_RtmpContex,buf, aAacInfoBufLen+2, 8,time,4);     //aac info type is 4
 	free(buf);
 	pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
-	return 1;
+	return nRet;
 }
 
 
-int SendAAC(const char *aAacBuf, DWORD aAacBufLen,DWORD time)
+//int SendAAC(const char *aAacBuf, DWORD aAacBufLen,DWORD time)
+int SendAAC(const char *aAacBuf, DWORD aAacBufLen,DWORD64 time)
 {
+	int nRet = -1;
 	char* buf = (char*)malloc(aAacBufLen+2);
 	pthread_mutex_lock(&global_RtmpContex->RtmpMutex);
 	if(global_RtmpContex->pRtmp == NULL){
 		pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
-		return 0;
+		return -1;
 	}
 	buf[0] = 0xaf;
 	buf[1] = 0x01;
 	memcpy(buf+2,aAacBuf,aAacBufLen);
-	SendRtmpPacket(global_RtmpContex,buf, aAacBufLen+2, 8,time,5);
+	nRet = SendRtmpPacket(global_RtmpContex,buf, aAacBufLen+2, 8,time,5);
 	free(buf);
 	pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
-	return 1;
+	return nRet;
 }
 
-int SendOpus(const char *aOpusBuf, DWORD aOpusBufLen,DWORD time)
+//int SendOpus(const char *aOpusBuf, DWORD aOpusBufLen,DWORD time)
+int SendOpus(const char *aOpusBuf, DWORD aOpusBufLen,DWORD64 time)
 {
-    char* buf = (char*)malloc(aOpusBufLen+1);
-    pthread_mutex_lock(&global_RtmpContex->RtmpMutex);
+	int nRet = -1;
+    	char* buf = (char*)malloc(aOpusBufLen+1);
+    	pthread_mutex_lock(&global_RtmpContex->RtmpMutex);
 	if(global_RtmpContex->pRtmp == NULL){
 		pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
-		return 0;
+		return -1;
 	}
 	buf[0] = 0xff;        
 	memcpy(buf+1,aOpusBuf,aOpusBufLen);
-    SendRtmpPacket(global_RtmpContex,buf, aOpusBufLen+1, 8,time,5);
+    	nRet = SendRtmpPacket(global_RtmpContex,buf, aOpusBufLen+1, 8,time,5);
 	free(buf);
-    pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
-    return 1;
+    	pthread_mutex_unlock(&global_RtmpContex->RtmpMutex);
+    	return nRet;
 }
 

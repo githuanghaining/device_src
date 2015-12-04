@@ -30,7 +30,6 @@
 #include <time.h>
 
 #include "rtmp_sys.h"
-#include "rtmpcommon.h"
 #include "log.h"
 #include <sys/types.h>
 
@@ -72,17 +71,6 @@ static const char *my_dhm_G = "4";
 #endif
 TLS_CTX RTMP_TLS_ctx;
 #endif
-
-static mobile_token_t mtt;
-static camera_token_t ctt;
-static unsigned char device_type=0;
-static unsigned char record_flag=0;
-
-static unsigned char
-rtmp_record_distinguish[8] = {
-    0x11, 0x22, 0x33, 0x44,0x88,0x77,0x66,0x55
-};
-
 
 #define RTMP_SIG_SIZE 1536
 #define RTMP_LARGE_HEADER_SIZE 12
@@ -1145,6 +1133,10 @@ int RTMP_getDiskList(RTMP *r)
 	return RTMP_SendCtrl(r, 40,100, 0);
 }
 
+int RTMP_getServerIP(RTMP *r)
+{
+        return RTMP_SendCtrl(r, 70,100, 0);
+}
 
 static int
 SocksNegotiate(RTMP *r)
@@ -1250,6 +1242,7 @@ RTMP_ToggleStream(RTMP *r)
   r->m_pausing = 3;
   return res;
 }
+
 
 void
 RTMP_DeleteStream(RTMP *r)
@@ -1671,6 +1664,8 @@ SAVC(flashVer);
 SAVC(swfUrl);
 SAVC(pageUrl);
 SAVC(tcUrl);
+SAVC(accessToken);
+SAVC(deviceType);
 SAVC(fpad);
 SAVC(capabilities);
 SAVC(audioCodecs);
@@ -1732,6 +1727,27 @@ SendConnectPacket(RTMP *r, RTMPPacket *cp)
       if (!enc)
 	return FALSE;
     }
+
+	char device_type_str[10];
+	memset(device_type_str,0,sizeof(device_type_str));
+	snprintf(device_type_str,sizeof(device_type_str)-1,"%d",r->device_type);
+	AVal device_type;
+	device_type.av_val = device_type_str;
+	device_type.av_len = strlen(device_type_str);
+    enc = AMF_EncodeNamedString(enc, pend, &av_deviceType, &device_type);
+    if (!enc) 
+      return FALSE;	
+  
+	if (strlen(r->accessToken)>0)
+    {
+    	AVal accessToken;
+		accessToken.av_val = r->accessToken;
+		accessToken.av_len = strlen(r->accessToken);
+      enc = AMF_EncodeNamedString(enc, pend, &av_accessToken, &accessToken);
+      if (!enc) 
+      	return FALSE;	
+    }
+  
   if (!(r->Link.protocol & RTMP_FEATURE_WRITE))
     {
       enc = AMF_EncodeNamedBoolean(enc, pend, &av_fpad, FALSE);
@@ -1825,6 +1841,121 @@ SendBGHasStream(RTMP *r, double dId, AVal *playpath)
   return RTMP_SendPacket(r, &packet, TRUE);
 }
 #endif
+
+SAVC(onMetaData);
+static int
+RTMP_SendMetaData(RTMP *r)
+{
+  AMFObject* obj = (AMFObject*)calloc(1,sizeof(AMFObject));
+  if(obj == NULL)
+  	return -1;
+  
+  obj->o_num = 11; 
+  AMFObjectProperty *prop = (AMFObjectProperty*)calloc(14,sizeof(AMFObjectProperty));
+  if(prop == NULL){
+	free(obj);
+	return -1;
+  }
+  
+  char* a0 = "duration";
+  char* a1 = "width";
+  char* a2 = "height";
+  char* a3 = "videodatarate";
+  char* a4 = "framerate";
+  char* a5 = "videocodecid";
+  char* a6 = "audiodatarate";
+  char* a7 = "audiosamplerate";
+  char* a8 = "audiosamplesize";
+  char* a9 = "stereo";
+  char* a10 = "audiocodecid";
+
+  prop[0].p_name.av_val = a0;
+  prop[0].p_name.av_len = strlen(a0);
+  prop[0].p_type = AMF_NUMBER;
+  prop[0].p_vu.p_number =  r->metaData.duration;
+  
+  prop[1].p_name.av_val = a1;
+  prop[1].p_name.av_len = strlen(a1);;
+  prop[1].p_type = AMF_NUMBER;
+  prop[1].p_vu.p_number =  r->metaData.width;
+  
+  prop[2].p_name.av_val = a2;
+  prop[2].p_name.av_len = strlen(a2);;
+  prop[2].p_type = AMF_NUMBER;
+  prop[2].p_vu.p_number =  r->metaData.height;
+  
+  prop[3].p_name.av_val = a3;
+  prop[3].p_name.av_len = strlen(a3);;
+  prop[3].p_type = AMF_NUMBER;
+  prop[3].p_vu.p_number =  r->metaData.videodatarate;
+  
+  prop[4].p_name.av_val = a4;
+  prop[4].p_name.av_len = strlen(a4);;
+  prop[4].p_type = AMF_NUMBER;
+  prop[4].p_vu.p_number =  r->metaData.framerate;
+  
+  prop[5].p_name.av_val = a5;
+  prop[5].p_name.av_len = strlen(a5);;
+  prop[5].p_type = AMF_NUMBER;
+  prop[5].p_vu.p_number =  r->metaData.videocodecid;
+  
+  prop[6].p_name.av_val = a6;
+  prop[6].p_name.av_len = strlen(a6);;
+  prop[6].p_type = AMF_NUMBER;
+  prop[6].p_vu.p_number =  r->metaData.audiodatarate;
+  
+  prop[7].p_name.av_val = a7;
+  prop[7].p_name.av_len = strlen(a7);;
+  prop[7].p_type = AMF_NUMBER;
+  prop[7].p_vu.p_number =  r->metaData.audiosamplerate;
+  
+  prop[8].p_name.av_val = a8;
+  prop[8].p_name.av_len = strlen(a8);;
+  prop[8].p_type = AMF_NUMBER;
+  prop[8].p_vu.p_number =  r->metaData.audiosamplesize;
+
+  prop[9].p_name.av_val = a9;
+  prop[9].p_name.av_len = strlen(a9);;
+  prop[9].p_type = AMF_BOOLEAN;
+  prop[9].p_vu.p_number =  r->metaData.stereo;
+  
+  prop[10].p_name.av_val = a10;
+  prop[10].p_name.av_len = strlen(a10);;
+  prop[10].p_type = AMF_NUMBER;
+  prop[10].p_vu.p_number =  r->metaData.audiocodecid;
+  
+  obj->o_props = prop;
+		  
+  RTMPPacket packet;
+  char pbuf[1024], *pend = pbuf + sizeof(pbuf);
+  char *enc;
+
+  packet.m_nChannel = 0x04;	// source channel (invoke)
+  packet.m_headerType = RTMP_PACKET_SIZE_LARGE;
+  packet.m_packetType = RTMP_PACKET_TYPE_INFO;
+  packet.m_nTimeStamp = 0;
+  packet.m_nInfoField2 = r->m_stream_id;
+  packet.m_hasAbsTimestamp = 0;
+  packet.m_body = pbuf + RTMP_MAX_HEADER_SIZE;
+
+  enc = packet.m_body;
+  enc = AMF_EncodeString(enc, pend, &av_onMetaData);
+  enc = AMF_EncodeEcmaArray(obj,enc,pend);
+  if (!enc)
+  {
+  	free(prop);
+	free(obj);
+	return FALSE;
+  }
+  
+  packet.m_nBodySize = enc - packet.m_body; 
+  int ret = RTMP_SendPacket(r, &packet, TRUE);
+  free(prop);
+  free(obj);
+  return ret;
+}
+
+
 
 SAVC(createStream);
 
@@ -3119,6 +3250,7 @@ HandleInvoke(RTMP *r, const char *body, unsigned int nBodySize)
 	  if (r->Link.protocol & RTMP_FEATURE_WRITE)
 	    {
 	      SendPublish(r);
+		  RTMP_SendMetaData(r);
 	    }
 	  else
 	    {
@@ -3428,7 +3560,7 @@ DumpMetaData(AMFObject *obj)
   return FALSE;
 }
 
-SAVC(onMetaData);
+
 SAVC(duration);
 SAVC(video);
 SAVC(audio);
@@ -3878,32 +4010,6 @@ RTMP_ReadPacket(RTMP *r, RTMPPacket *packet)
   return TRUE;
 }
 
-void setCameraToken(DWORD cid, DWORD deadline_time, unsigned char* token)
-{
-	ctt.cid = cid;
-	ctt.deadline_time = deadline_time;
-	memcpy(ctt.token,token,TOKEN_SIZE);
-}
-void setMobileToken(DWORD cid, DWORD user_id ,cid_list_t clt, DWORD deadline_time, unsigned char* token)
-{
-	mtt.cid = cid;
-	mtt.user_id = user_id;
-	mtt.clt = clt;
-	mtt.deadline_time = deadline_time;
-	memcpy(mtt.token,token,TOKEN_SIZE);
-}
-
-void setDeviceType(unsigned char type)
-{
-	device_type = type;
-}
-
-void setRecordFlag(unsigned char flag)
-{
-	record_flag = flag;
-}
-
-
 
 #ifndef CRYPTO
 static int
@@ -3925,49 +4031,15 @@ HandShake(RTMP *r, int FP9HandShake)
 
   memset(&clientsig[4], 0, 4);
  
-  if(device_type == 1){
-  		clientsig[8] = device_type;
-		#if 0
-		ptoken = &clientsig[9];
-	 	token_size = sizeof(ctt);
-		memcpy(ptoken,(char*)&ctt,token_size);
-		ptoken = ptoken+token_size;
-		memcpy(ptoken,rtmp_record_distinguish,sizeof(rtmp_record_distinguish));
-		ptoken = ptoken+sizeof(rtmp_record_distinguish);
-		*ptoken = record_flag;
-		int offset = 9+token_size+sizeof(rtmp_record_distinguish)+1;
-		for (i=offset; i < RTMP_SIG_SIZE; i++)
-	    	clientsig[i] = (char)(rand() % 256);
-		#else
-		for (i=9; i < RTMP_SIG_SIZE; i++)
-	    	clientsig[i] = (char)(rand() % 256);
-		#endif
-  }
-  else if(device_type == 2)
-  {
-  	 	clientsig[8] = device_type;
-
-		#if 0
-  		ptoken = &clientsig[9];
-		token_size = sizeof(mtt);
-		memcpy(ptoken,(char*)&mtt,token_size);
-		for (i=9+token_size; i < RTMP_SIG_SIZE; i++)
-	    	clientsig[i] = (char)(rand() % 256);
-		#else
-		for (i=9; i < RTMP_SIG_SIZE; i++)
-	    	clientsig[i] = (char)(rand() % 256);
-		#endif
-  }
-  else
-  {
-		#ifdef _DEBUG
-	  	for (i = 8; i < RTMP_SIG_SIZE; i++)
-	    	clientsig[i] = 0xff;
-		#else
-	  	for (i = 8; i < RTMP_SIG_SIZE; i++)
-	    	clientsig[i] = (char)(rand() % 256);
-		#endif
-  }
+ 
+  #ifdef _DEBUG
+  	for (i = 8; i < RTMP_SIG_SIZE; i++)
+  	clientsig[i] = 0xff;
+  #else
+  	for (i = 8; i < RTMP_SIG_SIZE; i++)
+  	clientsig[i] = (char)(rand() % 256);
+  #endif
+  
 
   if (!WriteN(r, clientbuf, RTMP_SIG_SIZE + 1))
     return FALSE;

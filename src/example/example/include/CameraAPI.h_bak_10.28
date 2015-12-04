@@ -1,0 +1,160 @@
+#ifndef __CAMERA_API_H__
+#define __CAMERA_API_H__
+
+#ifdef __cplusplus
+#if __cplusplus
+extern "C"{
+#endif
+#endif
+    
+    /*
+     
+     Todo:
+     rs解码有时候会出错
+		确认linux下时间精度问题：usleep nanosleep setitimer select
+		状态串里面增加推荐延迟和推荐码流参数
+		通过弹出包的时间戳计算卡顿情况
+		卡顿过后就不要往回找了
+		GF256 在系数为0和1时的处理方式需要确认
+     */
+    
+    //对外发送消息的回调函数：
+    //当该服务接收到调度服务器的开始推送命令时 会发出消息通知外壳调用PushData函数塞数据 json格式：{"Name":"ConnectionAcceptted"}
+    //当需要停止塞数据时 停止收数据 json格式：{"Name":"ConnectionClosed"}
+    //当该服务接收到时 对方发送的媒体数据时，会发出消息通知外壳调用PopData函数收数据 json格式：{"Name":"StartPopData"}
+    // 当设备登录成功或者配置变换时   {"Name":"PopConfig","Message":"HexConfigString(256字节 512字符)"}
+    //当设备收到在线消息时          {"Name":"PopMessage","Message":"HexMessageString(变长)","SrcID":"发送方ID"}
+    //当设备收到离线消息时          {"Name":"PopOffLineMessage","Message":"HexMessageString(变长)","SrcID":"发送方ID"} 
+#if 1   
+ 
+    //StatusBuffer[CLIENT_STATUS_BUFFER_LENGTH]; //0字节代表nat类型 1字节代表当前工作状态 2字节代表是否需要心跳返回 3字节代表是否需要编码 4字节代表启动模式 0是待命 1是udp广播 2是rtmp广播 3是录像 4是录像广播
+		//当前状态
+		typedef enum {
+			CLIENT_STATUS_CODE_READY              =     1,      //初始状态
+			CLIENT_STATUS_CODE_REQUEST_RELAY      =     2,      //正在请求转发
+			CLIENT_STATUS_CODE_CONNECTING_LIVE    =     3,      //正在连接中
+			CLIENT_STATUS_CODE_LIVEING            =     4,      //正在直播
+			CLIENT_STATUS_CODE_STOPING            =     5,      //停止过程中 
+			CLIENT_STATUS_CODE_ERROR              =     255     //异常状态
+		} ClientStatusEm;
+
+		//网关nat类型
+		typedef enum {
+			NAT_TYPE_INTERNET  = 1, //独立的公网IP
+			NAT_TYPE_UNKOWN    = 2, //未知类型
+			NAT_TYPE_SYNMETRIC = 3, //对称类型
+			NAT_TYPE_CONE      = 4  //锥形
+		} NatTypeEm;
+    
+		//数据帧类型
+		typedef enum {
+			NALU_TYPE_SLICE = 1,
+			NALU_TYPE_DPA = 2,
+			NALU_TYPE_DPB = 3,
+			NALU_TYPE_DPC = 4,
+			NALU_TYPE_IDR = 5,
+			NALU_TYPE_SEI = 6,
+			NALU_TYPE_SPS = 7,
+			NALU_TYPE_PPS = 8,
+			NALU_TYPE_AUD = 9,
+			NALU_TYPE_EOSEQ = 10,
+			NALU_TYPE_EOSTREAM = 11,
+			NALU_TYPE_FILL = 12,
+			NALU_TYPE_PREFIX = 14,
+			NALU_TYPE_SUB_SPS = 15,
+			NALU_TYPE_SLC_EXT = 20,
+			NALU_TYPE_VDRD = 24,
+			AAC_TYPE_INFO = 128,
+			AAC_TYPE_SAMPLE = 129
+		} FrameSampleTypeEm;
+
+	//RTMP Metadata 
+	typedef struct _RTMPMetaData
+        {
+                double  duration;
+                double  width;
+                double  height;
+                double  videodatarate;
+                double  framerate;
+                double  videocodecid;
+                double  audiodatarate;
+                double  audiosamplerate;
+                double  audiosamplesize;
+                double  stereo;                         //0 for false
+                double  audiocodecid;
+        }RTMPMetaData;
+
+
+#endif  
+
+    // 私有直播消息回调函数
+    typedef int (*D_MessageCallBack)(void *apData, const char *aMessage);
+    //RTMP消息回调函数 
+    typedef void (*D_RtmpAudioCallBack)(void *apData, char* aAudioData,int aDataLen,char aDataType);
+    //typedef void (*D_RtmpAudioCallBack)(void *apData, char* aAudioData,int aDataLen);
+ 
+ 		//注册rtmp音频数据回调
+    void D_SetRtmpAudioCallBack(void *apData,D_RtmpAudioCallBack aRtmpAudioCall); 
+ 
+
+    //开始云服务 接收调度命令         ini格式的配置串       开始采集并压缩音视频数据的回调函数
+    //return: 0---success ; other --failed 
+    int D_StartCloudService(const char*app_id, const char* aSN, const char *aHashID,void *apData, D_MessageCallBack apMessageCallBack);
+
+    //config:[Config]\r\nCID=%lu\r\nSN=%s%s\r\nLoginAddress=%s\r\nIsCaptureDev=1\r\nIsPlayDev=1\r\nIsSendBroadcast=0\r\nUdpSendInterval=2\r\n
+    int  D_StartCloudService2(const char* aConfigString, void *apData, D_MessageCallBack apMessageCallBack);
+    
+    //停止云服务
+    void  D_StopCloudService();
+
+    //get device status:version,login,online,packet lost count
+    char* D_GetStatus();
+
+    //get platform version
+    float D_GetPlatformVersion();
+ 
+    //获取设备的token，每次启动云服务都会获得新的token， token过期需要重新启动云服务
+    //return -1 -- failed; token length ----success(56字符)
+    int D_GetDeviceToken(char *aToken, unsigned int sizeOfToken);
+ 
+    //往该服务塞入音视频采样数据  数据层索引 当前固定为0    音视频采样缓冲区          音视频采样缓冲区长度    32位时间戳单位毫秒  采样类型h264 NALU_TYPE 或者 音频类型
+    int   D_PushData(unsigned long aDataLevelPos, const char *aDataBuffer, unsigned long aBufferLength, unsigned long aTimestamp, unsigned char apFrameSampleType);
+    
+    int D_SendRTMPData(char * aDataBuffer,unsigned long aBufferLength, unsigned long long aTimestamp,unsigned char apFrameSampleType);
+    
+    //弹出一个音视频采样缓冲区 数据层索引 当前固定为0           采样数据长度              32位时间戳  采 样类型h264 NALU_TYPE 或者 音频类型
+    char* D_PopData(unsigned long aDataLevelPos, unsigned long *apFrameSampleLength, unsigned long *apTimestamp, unsigned char *apFrameSampleType);
+    //type	int	截图的类型 1: 录像截图，2:封面截图，3:告警截图 
+    int  D_HttpPostPicture(int timestamp,char* image_buffer, long image_size, int image_type);
+
+    int D_PushMessage(const char *aMessage, unsigned long aMessageLen, int is_callServer);
+     
+    //连接
+    //开启rtmp服务;return: 0 ---success , other --- failed
+    // Mode :0是待命 1是udp广播 2是rtmp广播 3是录像 4是录像广播
+    int D_StartConnectToServer(char aMode, RTMPMetaData aMetaData);
+	
+    //断开连接
+    //关闭rtmp服务
+    int D_Disconnect();
+    
+    //上传设备配置参数,256字节的平台配置串
+    int D_SetDeviceConfig(const char *aConfig, unsigned int aConfigLen);
+
+    //上传设备自定义额外数据信息（摄像头的属性等），数据对平台透明，平台只是进行保存。
+    int D_SetDeviceExtraFields(const char *aData, unsigned int aDataLen);	
+
+    //int D_GetAlarmPlayInfo(const char* aUrl,unsigned char* buffer,int* size);
+    int D_GetAlarmPlayInfo(unsigned long long aAlarmTime);
+    //int D_SetAlarmInfo(unsigned long long aAlarmTime);  
+ 
+    void D_Send_Log(const char *msg);
+    int  D_GetDevHashID(unsigned long aSrcCid, char *apHashBuffer,int HashIdLength);
+ 
+#ifdef __cplusplus
+#if __cplusplus
+}
+#endif
+#endif
+
+#endif /* End of #ifndef __CAMERA_API_H__ */
